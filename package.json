@@ -1,0 +1,17 @@
+{
+  "name": "carnage-v4",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Browser-based 2D biplane dogfight game. See PROMPT.md for the design spec.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vite": "^5.4.0"
+  }
+}

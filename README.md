@@ -61,4 +61,3 @@ TASKS.md           # implementation worklist
 ## Manual test plan
 
 *Will be filled in at Phase 11 per `PROMPT.md` §19 acceptance criteria.*
-# Carnage-IV
