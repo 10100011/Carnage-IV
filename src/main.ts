@@ -1,5 +1,5 @@
 import { drawArena } from './arena';
-import { PHYSICS, WORLD } from './config';
+import { HITBOX, MATCH, PHYSICS, TOWER, WORLD } from './config';
 import { startLoop } from './loop';
 import { drawPlane, PLANE_SPRITE_EXTENT, type Plane } from './plane';
 
@@ -53,22 +53,44 @@ function init(): void {
   resize();
   window.addEventListener('resize', resize);
 
-  // Test plane starts airborne at roughly cruise speed, heading east, so the
-  // user can trigger a stall by pointing up (slows the plane until it drops
-  // below PHYSICS.stallThreshold). Edit these fields to reposition.
-  const testPlane: Plane = {
-    x: WORLD.width * 0.3,
-    y: WORLD.height * 0.4,
-    vx: 600,
-    vy: 0,
+  // Single test plane spawns grounded on the innermost slot of the left
+  // runway, facing the tower (§9.2, §11). Multi-plane placement and the
+  // right-runway mirror land in T5.1 / T8.1. Slot math: each side's usable
+  // length runs from the tower's inner edge out to the playfield edge, and
+  // plane i of n sits at i/(n+1) of that length measured from the tower. For
+  // n=1 on the left that's the midpoint between x=0 and the tower's left
+  // face. y places the hitbox bottom exactly on the runway surface.
+  //
+  // `spawnSlot` is the pose used for *both* initial spawn and respawn after a
+  // crash (T3.5 / §12). When T8.1 wires up per-plane slots this becomes a
+  // per-plane value.
+  const leftInnerEdge = TOWER.centreX - TOWER.width / 2;
+  const spawnSlot = {
+    x: leftInnerEdge * 0.5,
+    y: WORLD.groundY - HITBOX.planeRadius,
     heading: Math.PI / 2,
-    state: 'airborne',
+  };
+  const testPlane: Plane = {
+    x: spawnSlot.x,
+    y: spawnSlot.y,
+    vx: 0,
+    vy: 0,
+    heading: spawnSlot.heading,
+    state: 'grounded',
+    taxiCommitted: false,
+    respawnTimerSec: 0,
+    autoStartTimerSec: MATCH.autoStartIdleSec,
     color: '#ffd27a',
   };
 
   // Held-key map for input. Extracted to src/input.ts later (T5.2 P1/P2 mapping).
   const keys: Record<string, boolean> = {};
+  // One-shot press edges collected between updates. Consumed (and cleared) by
+  // update() so each physical press fires exactly one action, regardless of
+  // OS auto-repeat or how many sim ticks run this frame.
+  const pressedKeys = new Set<string>();
   window.addEventListener('keydown', (ev) => {
+    if (!ev.repeat) pressedKeys.add(ev.key.toLowerCase());
     keys[ev.key] = true;
   });
   window.addEventListener('keyup', (ev) => {
@@ -83,16 +105,112 @@ function init(): void {
     simSteps++;
     simTimeSec += dt;
 
-    // Rotation input. `[` = CCW, `]` = CW (T2.2 placeholders; A/D land in T5.2).
-    let rot = 0;
-    if (keys['[']) rot -= 1;
-    if (keys[']']) rot += 1;
-    if (rot !== 0) {
-      testPlane.heading += rot * PHYSICS.rotationRate * dt;
-      testPlane.heading = ((testPlane.heading % TAU) + TAU) % TAU;
+    // Respawn timer — §12, T3.5. Crashed planes sit motionless through the
+    // 1.5 s explosion delay (T11.1 will hook its animation off this same
+    // clock) and then reset to their runway slot, grounded and facing the
+    // original direction. `taxiCommitted` is cleared so the next press must
+    // re-commit, matching the §8.2.1 respawn-resets-the-state-machine rule.
+    if (testPlane.state === 'crashed') {
+      testPlane.respawnTimerSec -= dt;
+      if (testPlane.respawnTimerSec <= 0) {
+        testPlane.x = spawnSlot.x;
+        testPlane.y = spawnSlot.y;
+        testPlane.vx = 0;
+        testPlane.vy = 0;
+        testPlane.heading = spawnSlot.heading;
+        testPlane.state = 'grounded';
+        testPlane.taxiCommitted = false;
+        testPlane.respawnTimerSec = 0;
+        testPlane.autoStartTimerSec = MATCH.autoStartIdleSec;
+        console.log(`[respawn] simTime=${simTimeSec.toFixed(2)}s`);
+      }
     }
 
-    if (testPlane.state === 'airborne') {
+    // Anti-camping auto-start — §11, T3.6. While the plane sits idle on the
+    // runway with no taxi committed, count down from `autoStartIdleSec`. At
+    // zero the sim commits the taxi itself; the player no longer gets a say,
+    // and because the plane faces the tower that commit usually ends in a
+    // crash. The T−2 s / T−1 s warning pulses are visual polish (T11.2) and
+    // intentionally absent here.
+    if (testPlane.state === 'grounded' && !testPlane.taxiCommitted) {
+      testPlane.autoStartTimerSec -= dt;
+      if (testPlane.autoStartTimerSec <= 0) {
+        testPlane.taxiCommitted = true;
+        testPlane.autoStartTimerSec = 0;
+        console.log(`[auto-start] simTime=${simTimeSec.toFixed(2)}s`);
+      }
+    }
+
+    // Rotation input. `[` = CCW, `]` = CW (T2.2 placeholders; A/D land in T5.2).
+    // Grounded planes ignore rotation — they sit in their runway slot facing
+    // the tower until the action button (below) commits the taxi (§11).
+    //
+    // While the hitbox is still tangent to the runway (airborne but not yet
+    // climbed), rotation is clamped to the upper semicircle so the pilot
+    // can't pitch the nose into the runway during takeoff. This is a quality-
+    // of-life guard, not a prompt-mandated rule: §11's takeoff loop should be
+    // a short learning curve, not pointless danger. Once the plane lifts any
+    // distance above the surface, full 360° rotation returns.
+    if (testPlane.state === 'airborne' || testPlane.state === 'stalled') {
+      let rot = 0;
+      if (keys['[']) rot -= 1;
+      if (keys[']']) rot += 1;
+      if (rot !== 0) {
+        const newHeading =
+          ((testPlane.heading + rot * PHYSICS.rotationRate * dt) % TAU + TAU) % TAU;
+        const onRunway = testPlane.y + HITBOX.planeRadius >= WORLD.groundY;
+        if (onRunway && Math.cos(newHeading) < 0) {
+          // Nose would cross below horizontal while still on the runway —
+          // snap to the nearer horizontal. Invariant: prevHeading is already
+          // in the upper semicircle, so < π → clamp right (π/2), else left.
+          testPlane.heading = testPlane.heading < Math.PI ? Math.PI / 2 : 3 * Math.PI / 2;
+        } else {
+          testPlane.heading = newHeading;
+        }
+      }
+    }
+
+    // Action button — one input, two meanings (§8.2.1). Uses `s` per §14.1
+    // (P1 action); the P2 key `k` wires in at T5.2.
+    //   grounded + !taxiCommitted → commit taxi (T3.3 applies the thrust).
+    //   grounded +  taxiCommitted → ignored; a committed taxi cannot be aborted.
+    //   airborne / stalled        → fire (stub — real bullet in T4.1).
+    //   crashed                   → ignored.
+    if (pressedKeys.has('s')) {
+      if (testPlane.state === 'grounded') {
+        if (!testPlane.taxiCommitted) {
+          testPlane.taxiCommitted = true;
+          console.log(`[action] taxi committed at simTime=${simTimeSec.toFixed(2)}s`);
+        }
+      } else if (testPlane.state === 'airborne' || testPlane.state === 'stalled') {
+        console.log(`[fire] (stub) simTime=${simTimeSec.toFixed(2)}s`);
+      }
+    }
+    pressedKeys.clear();
+
+    if (testPlane.state === 'grounded' && testPlane.taxiCommitted) {
+      // Runway taxi — §8.2, §11. Full-power acceleration along heading; the
+      // plane is on the runway surface, so pitch coupling / gravity don't
+      // apply. Drag is the only resistance, matching the airborne level-flight
+      // formula with cos(heading)=0. Heading stays fixed at spawn value while
+      // grounded (rotation input gated above), so vy stays 0 and y is
+      // preserved on the runway surface. Lift-off fires when airspeed passes
+      // liftOffThreshold — at that instant bullet-immunity also ends (§10),
+      // which other modules key off `state !== 'grounded'` for free.
+      const speed = Math.hypot(testPlane.vx, testPlane.vy);
+      const accel = PHYSICS.thrust - PHYSICS.drag * speed;
+      let newSpeed = speed + accel * dt;
+      if (newSpeed < 0) newSpeed = 0;
+      const dirX = Math.sin(testPlane.heading);
+      const dirY = -Math.cos(testPlane.heading);
+      testPlane.vx = newSpeed * dirX;
+      testPlane.vy = newSpeed * dirY;
+
+      if (newSpeed > PHYSICS.liftOffThreshold) {
+        testPlane.state = 'airborne';
+        testPlane.taxiCommitted = false;
+      }
+    } else if (testPlane.state === 'airborne') {
       // Airborne physics — §8.2, §8.3. Velocity stays aligned with heading.
       // Pitch coupling handles gravity's only effect while airborne:
       //   accel along heading = thrust − drag·speed − climbPenalty·g·cos(heading)
@@ -152,6 +270,63 @@ function init(): void {
     // a plane can't skip past a full WORLD.width (1920) in one step.
     if (testPlane.x < 0) testPlane.x += WORLD.width;
     else if (testPlane.x >= WORLD.width) testPlane.x -= WORLD.width;
+
+    // Top-of-screen hard clamp (non-fatal). The ceiling stall triggers at
+    // WORLD.ceilingStallY, but upward momentum can still carry a stalled
+    // plane past y=0. Clamp centre at 0 and zero any remaining upward vy so
+    // gravity takes over immediately. No crash — just a wall.
+    if (testPlane.y < 0) {
+      testPlane.y = 0;
+      if (testPlane.vy < 0) testPlane.vy = 0;
+    }
+
+    // Tower collision — §9.6, §9.7. Plane circle vs tower AABB. Fires in any
+    // non-crashed state: airborne/stalled flights into the side or top, and
+    // the taxiing plane that runs out of runway before lift-off (the §11
+    // auto-start punishment). Closest-point-on-AABB / squared-distance test
+    // avoids a sqrt. Strict `<` so tangent contact isn't a crash — matches
+    // the ground-crash convention introduced in T3.3.
+    if (testPlane.state !== 'crashed') {
+      const towerLeft = TOWER.centreX - TOWER.width / 2;
+      const towerRight = TOWER.centreX + TOWER.width / 2;
+      const cx = Math.max(towerLeft, Math.min(testPlane.x, towerRight));
+      const cy = Math.max(TOWER.topY, Math.min(testPlane.y, WORLD.groundY));
+      const dx = testPlane.x - cx;
+      const dy = testPlane.y - cy;
+      if (dx * dx + dy * dy < HITBOX.planeRadius * HITBOX.planeRadius) {
+        testPlane.state = 'crashed';
+        testPlane.vx = 0;
+        testPlane.vy = 0;
+        testPlane.taxiCommitted = false;
+        testPlane.respawnTimerSec = MATCH.respawnDelaySec;
+        console.log(
+          `[crash] tower contact at x=${testPlane.x.toFixed(0)}, y=${testPlane.y.toFixed(0)}, simTime=${simTimeSec.toFixed(2)}s`,
+        );
+      }
+    }
+
+    // Ground crash — §9.8. Airborne or stalled plane whose hitbox penetrates
+    // the runway surface crashes. Strict-`>` (not `>=`) so that the instant
+    // after lift-off, when the hitbox is still tangent to the runway, the
+    // plane doesn't immediately re-crash. A real dive into the ground still
+    // fires the event on the next tick once y advances past the surface.
+    // Fires the crash event once (state transitions to 'crashed'); subsequent
+    // frames don't re-fire because physics is skipped in 'crashed' state.
+    // Respawn / explosion animation land in T3.5 / T11.1.
+    if (
+      (testPlane.state === 'airborne' || testPlane.state === 'stalled') &&
+      testPlane.y + HITBOX.planeRadius > WORLD.groundY
+    ) {
+      testPlane.state = 'crashed';
+      testPlane.vx = 0;
+      testPlane.vy = 0;
+      testPlane.y = WORLD.groundY - HITBOX.planeRadius;
+      testPlane.taxiCommitted = false;
+      testPlane.respawnTimerSec = MATCH.respawnDelaySec;
+      console.log(
+        `[crash] ground contact at x=${testPlane.x.toFixed(0)}, simTime=${simTimeSec.toFixed(2)}s`,
+      );
+    }
   }
 
   function render(): void {
@@ -177,7 +352,7 @@ function init(): void {
     ctx.fillStyle = '#fff';
     ctx.font = '28px system-ui, sans-serif';
     ctx.textAlign = 'left';
-    ctx.fillText('Carnage v4.0 — T2.8 stall recovery', 32, 48);
+    ctx.fillText('Carnage v4.0 — T3.6 auto-start', 32, 48);
 
     ctx.textAlign = 'right';
     const headingDeg = (testPlane.heading * 180) / Math.PI;
@@ -190,6 +365,12 @@ function init(): void {
     ctx.fillText(`speed:     ${speedValue.toFixed(1)} u/s`, WORLD.width - 32, 176);
     ctx.fillText(`altitude:  ${altitude.toFixed(0)}`, WORLD.width - 32, 208);
     ctx.fillText(`state:     ${testPlane.state}`, WORLD.width - 32, 240);
+    ctx.fillText(`taxi:      ${testPlane.taxiCommitted ? 'committed' : 'idle'}`, WORLD.width - 32, 272);
+    if (testPlane.state === 'crashed') {
+      ctx.fillText(`respawn:   ${testPlane.respawnTimerSec.toFixed(2)}s`, WORLD.width - 32, 304);
+    } else if (testPlane.state === 'grounded' && !testPlane.taxiCommitted) {
+      ctx.fillText(`auto-start: ${testPlane.autoStartTimerSec.toFixed(2)}s`, WORLD.width - 32, 304);
+    }
 
     ctx.restore();
   }

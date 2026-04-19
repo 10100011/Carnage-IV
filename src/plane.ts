@@ -1,7 +1,7 @@
 import { HITBOX, STROKE } from './config';
 
-/** Plane life-cycle states. §8.2 / §8.4 / §11. */
-export type PlaneState = 'grounded' | 'airborne' | 'stalled';
+/** Plane life-cycle states. §8.2 / §8.4 / §11 / §12. */
+export type PlaneState = 'grounded' | 'airborne' | 'stalled' | 'crashed';
 
 /**
  * Plane entity.
@@ -18,6 +18,30 @@ export interface Plane {
   vy: number;
   heading: number;
   state: PlaneState;
+  /**
+   * Set by the first action-button press while grounded — the commit-to-taxi
+   * signal from §8.2.1 / §11. The state stays `grounded` while the plane
+   * accelerates along the runway (T3.3); liftoff flips it to `airborne` and
+   * resets this flag. Respawn (T3.5) also resets it.
+   */
+  taxiCommitted: boolean;
+  /**
+   * Seconds remaining until respawn when `state === 'crashed'` (§12,
+   * `MATCH.respawnDelaySec`). Counted down by the sim; on reaching 0 the
+   * plane respawns in its runway slot. Unused (kept at 0) in other states.
+   * Polish-phase T11.1 will drive the explosion animation off this same
+   * clock.
+   */
+  respawnTimerSec: number;
+  /**
+   * Seconds remaining on the anti-camping auto-start countdown (§11, T3.6).
+   * Counts down only while `state === 'grounded' && !taxiCommitted`. Reset
+   * to `MATCH.autoStartIdleSec` on spawn and on every respawn. At ≤ 0 the
+   * sim flips `taxiCommitted` itself — per §11, the timer's reset semantics
+   * are trivial: it runs from spawn until the player commits or auto-start
+   * fires, with no intermediate "taxi-stopped" state to reset from.
+   */
+  autoStartTimerSec: number;
   /** Placeholder identity colour. Polish phase replaces with a real palette (§16). */
   color: string;
 }
@@ -53,9 +77,12 @@ export function drawPlane(
   ctx.rotate(plane.heading);
 
   // Nose points along local -y (= screen up at heading 0°).
-  // Stalled planes render in a distressed red (§8.4 "look distressed");
-  // polish pass will replace this with a proper wobble / smoke effect.
-  ctx.fillStyle = plane.state === 'stalled' ? '#c84c4c' : plane.color;
+  // State-dependent fill — stall = distressed red, crashed = wrecked grey.
+  // Replaced by proper visuals (wobble/smoke/explosion) at T11.1 / T11.3.
+  ctx.fillStyle =
+    plane.state === 'stalled' ? '#c84c4c'
+    : plane.state === 'crashed' ? '#555'
+    : plane.color;
   ctx.beginPath();
   ctx.moveTo(0, -r * 1.3);
   ctx.lineTo(-r * 0.9, r * 0.7);
