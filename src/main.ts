@@ -17,50 +17,59 @@ import {
 const TAU = Math.PI * 2;
 
 /**
- * Minimum distance from a line-segment to a point, compared against a radius
- * — returns true iff the segment (a → b) passes within `radius` of the
- * circle centre (cx, cy). Used by the swept-segment bullet collision tests
- * (§9.7) so a bullet moving faster than a hitbox's diameter per tick can't
- * tunnel through. Strict `<` so tangent contact isn't a hit, matching the
- * crash conventions elsewhere.
+ * Parameter `t ∈ [0, 1]` at which segment (a → b) first enters the open disk
+ * of radius `radius` centred at (cx, cy), or `Infinity` if the segment
+ * misses or merely grazes (tangent). A segment that starts inside the disk
+ * returns 0 — it's already hitting at step start.
+ *
+ * Strict `<` convention (tangent = miss) matches the crash tests elsewhere.
+ * Returning a t-param instead of a boolean lets the bullet loop resolve
+ * same-step hits against multiple targets by picking the nearest (§9.6 +
+ * §9.7): a plane in front of the tower must die before the tower blocks.
  */
-function segmentHitsCircle(
+function segmentCircleEntryT(
   ax: number, ay: number,
   bx: number, by: number,
   cx: number, cy: number,
   radius: number,
-): boolean {
+): number {
   const dx = bx - ax;
   const dy = by - ay;
-  const lenSq = dx * dx + dy * dy;
-  let closestX: number;
-  let closestY: number;
-  if (lenSq === 0) {
-    closestX = ax;
-    closestY = ay;
-  } else {
-    const t = Math.max(0, Math.min(1, ((cx - ax) * dx + (cy - ay) * dy) / lenSq));
-    closestX = ax + t * dx;
-    closestY = ay + t * dy;
+  const fx = ax - cx;
+  const fy = ay - cy;
+  const a = dx * dx + dy * dy;
+  const c = fx * fx + fy * fy - radius * radius;
+  if (a === 0) {
+    // Degenerate segment = point. Strictly inside the disk ⇒ hit at t=0.
+    return c < 0 ? 0 : Infinity;
   }
-  const ex = closestX - cx;
-  const ey = closestY - cy;
-  return ex * ex + ey * ey < radius * radius;
+  const b = 2 * (fx * dx + fy * dy);
+  const disc = b * b - 4 * a * c;
+  if (disc <= 0) return Infinity;
+  const sq = Math.sqrt(disc);
+  const t0 = (-b - sq) / (2 * a);
+  const t1 = (-b + sq) / (2 * a);
+  if (t0 >= 0 && t0 <= 1) return t0;
+  if (t0 < 0 && t1 > 0) return 0; // segment starts inside the disk
+  return Infinity;
 }
 
 /**
- * Does segment (a → b) intersect the axis-aligned rectangle? Liang-Barsky
- * parameter clipping — tests all four slabs and returns true iff the t-range
- * that satisfies every slab is non-empty. Used for the swept-segment bullet
- * vs tower test (§9.6, T4.5). Boundary touches count as hits (a round that
- * just grazes the tower should still be blocked).
+ * Parameter `t ∈ [0, 1]` at which segment (a → b) first enters the AABB, or
+ * `Infinity` if it misses. Liang-Barsky parameter clipping: tests all four
+ * slabs, narrows [t0, t1] to the portion inside the rectangle, returns t0
+ * on success (the entry point). A segment starting inside the rectangle
+ * returns 0.
+ *
+ * Boundary contact counts as a hit (grazing round still blocked) — tower is
+ * a solid block in §9.6, unlike the strict-< plane-circle convention.
  */
-function segmentHitsAabb(
+function segmentAabbEntryT(
   ax: number, ay: number,
   bx: number, by: number,
   left: number, top: number,
   right: number, bottom: number,
-): boolean {
+): number {
   let t0 = 0;
   let t1 = 1;
   const dx = bx - ax;
@@ -77,11 +86,11 @@ function segmentHitsAabb(
     }
     return true;
   };
-  if (!clip(-dx, ax - left)) return false;
-  if (!clip(dx, right - ax)) return false;
-  if (!clip(-dy, ay - top)) return false;
-  if (!clip(dy, bottom - ay)) return false;
-  return true;
+  if (!clip(-dx, ax - left)) return Infinity;
+  if (!clip(dx, right - ax)) return Infinity;
+  if (!clip(-dy, ay - top)) return Infinity;
+  if (!clip(dy, bottom - ay)) return Infinity;
+  return t0;
 }
 
 interface Viewport {
@@ -169,17 +178,22 @@ function init(): void {
   const bullets: Bullet[] = [];
 
   // Held-key map for input. Extracted to src/input.ts later (T5.2 P1/P2 mapping).
+  // Both the held-key map and the press-edge set store lowercased key names,
+  // so downstream lookups (`keys['s']`, `pressedKeys.has('s')`) work whether
+  // or not caps lock is on. Non-letter keys like `[` / `]` are unaffected by
+  // the lowercase pass.
   const keys: Record<string, boolean> = {};
   // One-shot press edges collected between updates. Consumed (and cleared) by
   // update() so each physical press fires exactly one action, regardless of
   // OS auto-repeat or how many sim ticks run this frame.
   const pressedKeys = new Set<string>();
   window.addEventListener('keydown', (ev) => {
-    if (!ev.repeat) pressedKeys.add(ev.key.toLowerCase());
-    keys[ev.key] = true;
+    const k = ev.key.toLowerCase();
+    if (!ev.repeat) pressedKeys.add(k);
+    keys[k] = true;
   });
   window.addEventListener('keyup', (ev) => {
-    keys[ev.key] = false;
+    keys[ev.key.toLowerCase()] = false;
   });
 
   let frameCount = 0;
@@ -482,44 +496,47 @@ function init(): void {
 
       let consumed = false;
 
-      // Tower block — §9.6, §2, T4.5. Bullets stop on first contact with the
-      // tower AABB. Checked before the plane test so a target hiding behind
-      // the tower (low-altitude cover per §2) isn't shot through it.
-      if (
-        segmentHitsAabb(
+      // Resolve tower + plane hits by nearest-along-segment (t-param). The
+      // §9.6 tower-blocks-bullets rule and §2's "tower as cover" semantics
+      // only work if the nearer hit wins: a plane in front of the tower
+      // must die before the tower blocks, and vice versa. On an exact tie
+      // (zero-probability in float) the tower wins — cover-biased.
+      const towerT = segmentAabbEntryT(
+        b.prevX, b.prevY,
+        b.x, b.y,
+        TOWER.centreX - TOWER.width / 2,
+        TOWER.topY,
+        TOWER.centreX + TOWER.width / 2,
+        WORLD.groundY,
+      );
+
+      let planeT = Infinity;
+      let hitTarget: Plane | undefined;
+      for (const target of planesForCollision) {
+        if (target.state === 'crashed') continue;
+        // Grounded-plane immunity — §10, T4.6. Position-based, NOT state-
+        // based: any plane whose hitbox still touches the runway surface
+        // (including the tangent-to-surface frame right after lift-off) is
+        // bulletproof. Immunity ends the instant the hitbox leaves the
+        // runway — §10 explicitly rules out a post-liftoff grace window.
+        if (target.y + HITBOX.planeRadius >= WORLD.groundY) continue;
+        const t = segmentCircleEntryT(
           b.prevX, b.prevY,
           b.x, b.y,
-          TOWER.centreX - TOWER.width / 2,
-          TOWER.topY,
-          TOWER.centreX + TOWER.width / 2,
-          WORLD.groundY,
-        )
-      ) {
-        consumed = true;
+          target.x, target.y,
+          HITBOX.planeRadius,
+        );
+        if (t < planeT) {
+          planeT = t;
+          hitTarget = target;
+        }
       }
 
-      if (!consumed) {
-        for (const target of planesForCollision) {
-          if (target.state === 'crashed') continue;
-          // Grounded-plane immunity — §10, T4.6. Position-based, NOT state-
-          // based: any plane whose hitbox still touches the runway surface
-          // (including the tangent-to-surface frame right after lift-off)
-          // is bulletproof. Immunity ends the instant the hitbox leaves the
-          // runway — §10 explicitly rules out a post-liftoff grace window.
-          if (target.y + HITBOX.planeRadius >= WORLD.groundY) continue;
-          if (
-            segmentHitsCircle(
-              b.prevX, b.prevY,
-              b.x, b.y,
-              target.x, target.y,
-              HITBOX.planeRadius,
-            )
-          ) {
-            crashPlane(target, b.owner === target ? 'self-kill bullet' : 'bullet');
-            consumed = true;
-            break;
-          }
-        }
+      if (towerT <= planeT && Number.isFinite(towerT)) {
+        consumed = true; // tower blocked the round
+      } else if (hitTarget !== undefined) {
+        crashPlane(hitTarget, b.owner === hitTarget ? 'self-kill bullet' : 'bullet');
+        consumed = true;
       }
 
       // Edge expiry — §10, T4.3. Bullets never wrap; they disappear at any

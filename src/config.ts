@@ -164,6 +164,12 @@ export type AiDifficulty = keyof typeof AI;
 export const VISUAL = {
   /** Tan runway band drawn above WORLD.groundY. Gameplay ground line is WORLD.groundY regardless. */
   runwayThickness: 18,
+  /**
+   * Bullet draw radius in logical units. Collision is point-based per §9.7
+   * (bullets are swept as line segments), so this is purely visual — size
+   * it for §16.3 readability against both sky and ground.
+   */
+  bulletRadius: 4,
 } as const;
 
 /**

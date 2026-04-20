@@ -1,4 +1,4 @@
-import { BULLETS, STROKE } from './config';
+import { BULLETS, STROKE, VISUAL } from './config';
 import type { Plane } from './plane';
 
 /**
@@ -34,9 +34,6 @@ export interface Bullet {
   owner: Plane;
 }
 
-/** Bullet draw radius in logical units — §16.3 readability against both sky and ground. */
-export const BULLET_RADIUS = 4;
-
 /**
  * Spawn a round at the given nose position, aligned to `heading`. No
  * velocity inheritance from the firing plane (§10).
@@ -71,7 +68,7 @@ export function drawBullet(ctx: CanvasRenderingContext2D, bullet: Bullet): void 
   ctx.strokeStyle = '#2a2014';
   ctx.lineWidth = STROKE.divider;
   ctx.beginPath();
-  ctx.arc(bullet.x, bullet.y, BULLET_RADIUS, 0, Math.PI * 2);
+  ctx.arc(bullet.x, bullet.y, VISUAL.bulletRadius, 0, Math.PI * 2);
   ctx.fill();
   ctx.stroke();
 }
