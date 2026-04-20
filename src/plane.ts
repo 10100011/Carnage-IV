@@ -49,8 +49,29 @@ export interface Plane {
    * first press is never rate-gated.
    */
   lastFireAtSec: number;
+  /**
+   * Remaining lives (§12). Starts at `MATCH.startingLives` (8). Decrements
+   * on every crash — the `crashPlane` helper's idempotency guard keeps
+   * multi-source same-tick crashes to a single decrement. At 0 the plane
+   * is permanently out: `handleRespawn` skips the reset, so the wreck
+   * stays where it fell until match end.
+   */
+  lives: number;
   /** Placeholder identity colour. Polish phase replaces with a real palette (§16). */
   color: string;
+  /**
+   * Per-plane spawn pose (runway slot + facing) per §9.2. Held on the plane
+   * instance so the respawn path (T3.5 / §12) can look it up directly
+   * without a parallel lookup table. Treat as readonly after construction.
+   */
+  spawn: { readonly x: number; readonly y: number; readonly heading: number };
+  /**
+   * Render the sprite horizontally flipped before heading rotation (§9.2).
+   * True for right-runway planes so an asymmetric sprite (T11.7) reads with
+   * its correct side-up regardless of facing. Invisible on the current
+   * symmetric placeholder triangle; wired now so T11.7 is drop-in.
+   */
+  mirror: boolean;
 }
 
 // Placeholder sprite is drawn a little larger than the collision circle so
@@ -89,6 +110,11 @@ export function drawPlane(
   ctx.save();
   ctx.translate(plane.x + xOffset, plane.y);
   ctx.rotate(plane.heading);
+  // Mirror is applied *after* rotate so it flips the sprite in its local
+  // (post-rotation) frame — equivalent to negating local x before drawing.
+  // That keeps wheels-down / canopy-up on the asymmetric T11.7 sprite
+  // regardless of whether the plane faces left or right.
+  if (plane.mirror) ctx.scale(-1, 1);
 
   // Nose points along local -y (= screen up at heading 0°).
   // State-dependent fill — stall = distressed red, crashed = wrecked grey.

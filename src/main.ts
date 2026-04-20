@@ -5,7 +5,7 @@ import {
   spawnBullet,
   type Bullet,
 } from './bullet';
-import { BULLETS, HITBOX, MATCH, PHYSICS, TOWER, WORLD } from './config';
+import { BULLETS, HITBOX, MATCH, PHYSICS, STROKE, TOWER, WORLD } from './config';
 import { startLoop } from './loop';
 import {
   drawPlane,
@@ -141,36 +141,69 @@ function init(): void {
   resize();
   window.addEventListener('resize', resize);
 
-  // Single test plane spawns grounded on the innermost slot of the left
-  // runway, facing the tower (§9.2, §11). Multi-plane placement and the
-  // right-runway mirror land in T5.1 / T8.1. Slot math: each side's usable
-  // length runs from the tower's inner edge out to the playfield edge, and
-  // plane i of n sits at i/(n+1) of that length measured from the tower. For
-  // n=1 on the left that's the midpoint between x=0 and the tower's left
-  // face. y places the hitbox bottom exactly on the runway surface.
-  //
-  // `spawnSlot` is the pose used for *both* initial spawn and respawn after a
-  // crash (T3.5 / §12). When T8.1 wires up per-plane slots this becomes a
-  // per-plane value.
+  // Spawn slot math per §9.2: each runway side's usable length runs from the
+  // tower's inner edge out to the playfield edge, and plane i of n on that
+  // side sits at i/(n+1) of that length measured from the tower (plane 1 is
+  // innermost). With two planes total (one per side), each is the midpoint
+  // of its half. y places the hitbox bottom exactly on the runway surface.
+  // N-plane generalization is T8.1's job; today we hand-roll n=1 per side.
   const leftInnerEdge = TOWER.centreX - TOWER.width / 2;
-  const spawnSlot = {
+  const rightInnerEdge = TOWER.centreX + TOWER.width / 2;
+  const groundedY = WORLD.groundY - HITBOX.planeRadius;
+
+  function makeGroundedPlane(opts: {
+    x: number;
+    heading: number;
+    color: string;
+    mirror: boolean;
+  }): Plane {
+    return {
+      x: opts.x,
+      y: groundedY,
+      vx: 0,
+      vy: 0,
+      heading: opts.heading,
+      state: 'grounded',
+      taxiCommitted: false,
+      respawnTimerSec: 0,
+      autoStartTimerSec: MATCH.autoStartIdleSec,
+      lastFireAtSec: Number.NEGATIVE_INFINITY,
+      lives: MATCH.startingLives,
+      color: opts.color,
+      spawn: { x: opts.x, y: groundedY, heading: opts.heading },
+      mirror: opts.mirror,
+    };
+  }
+
+  // P1 on the left runway, facing the tower (heading π/2).
+  const plane1 = makeGroundedPlane({
     x: leftInnerEdge * 0.5,
-    y: WORLD.groundY - HITBOX.planeRadius,
     heading: Math.PI / 2,
-  };
-  const testPlane: Plane = {
-    x: spawnSlot.x,
-    y: spawnSlot.y,
-    vx: 0,
-    vy: 0,
-    heading: spawnSlot.heading,
-    state: 'grounded',
-    taxiCommitted: false,
-    respawnTimerSec: 0,
-    autoStartTimerSec: MATCH.autoStartIdleSec,
-    lastFireAtSec: Number.NEGATIVE_INFINITY,
     color: '#ffd27a',
-  };
+    mirror: false,
+  });
+  // P2 on the right runway, facing the tower (heading 3π/2), sprite mirrored
+  // per §9.2. T5.2 wires its input; until then it sits idle.
+  const plane2 = makeGroundedPlane({
+    x: (rightInnerEdge + WORLD.width) * 0.5,
+    heading: 3 * Math.PI / 2,
+    color: '#7ac6ff',
+    mirror: true,
+  });
+  const planes: Plane[] = [plane1, plane2];
+
+  // Per-plane human control bindings, index-aligned with `planes` (§14.1).
+  // `null` entries mean "no human" — T6 fills those with AI pilots, and
+  // stepPhysics still runs for the plane either way.
+  interface Controls {
+    ccw: string;
+    action: string;
+    cw: string;
+  }
+  const controls: Array<Controls | null> = [
+    { ccw: 'a', action: 's', cw: 'd' },
+    { ccw: 'j', action: 'k', cw: 'l' },
+  ];
 
   // All live bullets fired by any plane. Per-plane cap (§10, T4.2) and
   // edge-expiry (T4.3) layer in next; for T4.1 the pool grows on fire and
@@ -189,16 +222,68 @@ function init(): void {
   const pressedKeys = new Set<string>();
   window.addEventListener('keydown', (ev) => {
     const k = ev.key.toLowerCase();
+    // Result screen shortcut: Enter / Space restarts (§12 play-again). Keys
+    // are not routed into the sim while frozen — matchOver already early-
+    // returns in update() but blocking the press here stops stale keystate
+    // from bleeding into the next match.
+    if (matchOver && (k === 'enter' || k === ' ')) {
+      ev.preventDefault();
+      resetMatch();
+      return;
+    }
     if (!ev.repeat) pressedKeys.add(k);
     keys[k] = true;
   });
   window.addEventListener('keyup', (ev) => {
     keys[ev.key.toLowerCase()] = false;
   });
+  // Click anywhere on the canvas while the result screen is up restarts —
+  // the Play Again button is the visual affordance, but a click anywhere
+  // counts (forgiving for touch / mobile when those land at T10).
+  canvas.addEventListener('click', () => {
+    if (matchOver) resetMatch();
+  });
 
   let frameCount = 0;
   let simSteps = 0;
   let simTimeSec = 0;
+
+  // Match lifecycle — §12. `matchOver` freezes the sim and shows the result
+  // screen; `matchOutcome` records who won (or draw for simultaneous last-
+  // life eliminations). Cleared by `resetMatch` when the player hits Play
+  // Again.
+  let matchOver = false;
+  let matchOutcome: 'P1' | 'P2' | 'draw' | null = null;
+
+  /**
+   * Reset every plane to its spawn pose with full lives, clear all bullets
+   * and per-plane timers, and flip `matchOver` off. Called when the player
+   * clicks Play Again or hits Enter / Space on the result screen.
+   */
+  function resetMatch(): void {
+    for (const p of planes) {
+      p.x = p.spawn.x;
+      p.y = p.spawn.y;
+      p.vx = 0;
+      p.vy = 0;
+      p.heading = p.spawn.heading;
+      p.state = 'grounded';
+      p.taxiCommitted = false;
+      p.respawnTimerSec = 0;
+      p.autoStartTimerSec = MATCH.autoStartIdleSec;
+      p.lastFireAtSec = Number.NEGATIVE_INFINITY;
+      p.lives = MATCH.startingLives;
+    }
+    bullets.length = 0;
+    // Flush any input collected while the result screen was up so it can't
+    // bleed into the first tick of the new match (held rotation keys, a
+    // stray taxi-commit press during result-screen fiddling, etc.).
+    pressedKeys.clear();
+    for (const k of Object.keys(keys)) delete keys[k];
+    matchOver = false;
+    matchOutcome = null;
+    console.log('[match] reset — new match');
+  }
 
   /**
    * Apply the standard crash transition to a plane and arm the explosion /
@@ -217,260 +302,300 @@ function init(): void {
     plane.vy = 0;
     plane.taxiCommitted = false;
     plane.respawnTimerSec = MATCH.respawnDelaySec;
+    plane.lives -= 1;
     console.log(
-      `[crash] ${reason} at x=${plane.x.toFixed(0)}, y=${plane.y.toFixed(0)}, simTime=${simTimeSec.toFixed(2)}s`,
+      `[crash] ${reason} at x=${plane.x.toFixed(0)}, y=${plane.y.toFixed(0)}, lives=${plane.lives}, simTime=${simTimeSec.toFixed(2)}s`,
     );
   }
 
-  function update(dt: number): void {
-    simSteps++;
-    simTimeSec += dt;
-
-    // Respawn timer — §12, T3.5. Crashed planes sit motionless through the
-    // 1.5 s explosion delay (T11.1 will hook its animation off this same
-    // clock) and then reset to their runway slot, grounded and facing the
-    // original direction. `taxiCommitted` is cleared so the next press must
-    // re-commit, matching the §8.2.1 respawn-resets-the-state-machine rule.
-    if (testPlane.state === 'crashed') {
-      testPlane.respawnTimerSec -= dt;
-      if (testPlane.respawnTimerSec <= 0) {
-        testPlane.x = spawnSlot.x;
-        testPlane.y = spawnSlot.y;
-        testPlane.vx = 0;
-        testPlane.vy = 0;
-        testPlane.heading = spawnSlot.heading;
-        testPlane.state = 'grounded';
-        testPlane.taxiCommitted = false;
-        testPlane.respawnTimerSec = 0;
-        testPlane.autoStartTimerSec = MATCH.autoStartIdleSec;
-        testPlane.lastFireAtSec = Number.NEGATIVE_INFINITY;
-        console.log(`[respawn] simTime=${simTimeSec.toFixed(2)}s`);
-      }
+  /**
+   * Respawn handler — §12, T3.5. Crashed planes sit motionless through the
+   * 1.5 s explosion delay (T11.1 will hook its animation off this same
+   * clock) and then reset to their runway slot, grounded, facing the
+   * original direction. `taxiCommitted` is cleared so the next press must
+   * re-commit, matching the §8.2.1 respawn-resets-the-state-machine rule.
+   */
+  function handleRespawn(p: Plane, dt: number): void {
+    if (p.state !== 'crashed') return;
+    p.respawnTimerSec -= dt;
+    if (p.respawnTimerSec > 0) return;
+    if (p.lives <= 0) {
+      // Permanently out (§12). Clamp the timer so it doesn't drift negative
+      // and stays read-correct in the debug HUD; wreck stays where it fell.
+      // Match-end / result-screen logic is T5.5.
+      p.respawnTimerSec = 0;
+      return;
     }
+    p.x = p.spawn.x;
+    p.y = p.spawn.y;
+    p.vx = 0;
+    p.vy = 0;
+    p.heading = p.spawn.heading;
+    p.state = 'grounded';
+    p.taxiCommitted = false;
+    p.respawnTimerSec = 0;
+    p.autoStartTimerSec = MATCH.autoStartIdleSec;
+    p.lastFireAtSec = Number.NEGATIVE_INFINITY;
+    console.log(`[respawn] simTime=${simTimeSec.toFixed(2)}s`);
+  }
 
-    // Anti-camping auto-start — §11, T3.6. While the plane sits idle on the
-    // runway with no taxi committed, count down from `autoStartIdleSec`. At
-    // zero the sim commits the taxi itself; the player no longer gets a say,
-    // and because the plane faces the tower that commit usually ends in a
-    // crash. The T−2 s / T−1 s warning pulses are visual polish (T11.2) and
-    // intentionally absent here.
-    if (testPlane.state === 'grounded' && !testPlane.taxiCommitted) {
-      testPlane.autoStartTimerSec -= dt;
-      if (testPlane.autoStartTimerSec <= 0) {
-        testPlane.taxiCommitted = true;
-        testPlane.autoStartTimerSec = 0;
-        console.log(`[auto-start] simTime=${simTimeSec.toFixed(2)}s`);
-      }
+  /**
+   * Anti-camping auto-start — §11, T3.6. While the plane sits idle on the
+   * runway with no taxi committed, count down from `autoStartIdleSec`. At
+   * zero the sim commits the taxi itself; because the plane faces the tower
+   * that commit typically ends in a crash. T−2 s / T−1 s warning pulses
+   * are visual polish (T11.2) and deliberately absent here.
+   */
+  function handleAutoStart(p: Plane, dt: number): void {
+    if (p.state !== 'grounded' || p.taxiCommitted) return;
+    p.autoStartTimerSec -= dt;
+    if (p.autoStartTimerSec <= 0) {
+      p.taxiCommitted = true;
+      p.autoStartTimerSec = 0;
+      console.log(`[auto-start] simTime=${simTimeSec.toFixed(2)}s`);
     }
+  }
 
-    // Rotation input. `[` = CCW, `]` = CW (T2.2 placeholders; A/D land in T5.2).
-    // Grounded planes ignore rotation — they sit in their runway slot facing
-    // the tower until the action button (below) commits the taxi (§11).
-    //
-    // While the hitbox is still tangent to the runway (airborne but not yet
-    // climbed), rotation is clamped to the upper semicircle so the pilot
-    // can't pitch the nose into the runway during takeoff. This is a quality-
-    // of-life guard, not a prompt-mandated rule: §11's takeoff loop should be
-    // a short learning curve, not pointless danger. Once the plane lifts any
-    // distance above the surface, full 360° rotation returns.
-    if (testPlane.state === 'airborne' || testPlane.state === 'stalled') {
-      let rot = 0;
-      if (keys['[']) rot -= 1;
-      if (keys[']']) rot += 1;
-      if (rot !== 0) {
-        const newHeading =
-          ((testPlane.heading + rot * PHYSICS.rotationRate * dt) % TAU + TAU) % TAU;
-        const onRunway = testPlane.y + HITBOX.planeRadius >= WORLD.groundY;
-        if (onRunway && Math.cos(newHeading) < 0) {
-          // Nose would cross below horizontal while still on the runway —
-          // snap to the nearer horizontal. Invariant: prevHeading is already
-          // in the upper semicircle, so < π → clamp right (π/2), else left.
-          testPlane.heading = testPlane.heading < Math.PI ? Math.PI / 2 : 3 * Math.PI / 2;
-        } else {
-          testPlane.heading = newHeading;
-        }
-      }
+  /**
+   * Bullet spawn from the plane's nose, gated by the 2-bullet count cap
+   * (§10, T4.2). Bullet velocity = heading unit × BULLETS.speed with no
+   * inheritance from the plane's own velocity (§10). Updates the plane's
+   * `lastFireAtSec` so the held-auto-fire loop paces itself.
+   */
+  function attemptFire(p: Plane): boolean {
+    if (countBulletsOwnedBy(bullets, p) >= BULLETS.maxPerPlane) return false;
+    const noseX = p.x + PLANE_NOSE_OFFSET * Math.sin(p.heading);
+    const noseY = p.y - PLANE_NOSE_OFFSET * Math.cos(p.heading);
+    bullets.push(spawnBullet(noseX, noseY, p.heading, p));
+    p.lastFireAtSec = simTimeSec;
+    return true;
+  }
+
+  /**
+   * Rotation input — §8.1, §14.1. Active in airborne / stalled states.
+   * Grounded planes ignore rotation (§11 — they face the tower until the
+   * action button commits the taxi). While the hitbox is still tangent to
+   * the runway (airborne but not yet climbed), rotation is clamped to the
+   * upper semicircle so the pilot can't pitch the nose into the runway
+   * during takeoff — a quality-of-life guard, not a prompt-mandated rule.
+   */
+  function applyRotationInput(p: Plane, ctrl: Controls, dt: number): void {
+    if (p.state !== 'airborne' && p.state !== 'stalled') return;
+    let rot = 0;
+    if (keys[ctrl.ccw]) rot -= 1;
+    if (keys[ctrl.cw]) rot += 1;
+    if (rot === 0) return;
+    const newHeading =
+      ((p.heading + rot * PHYSICS.rotationRate * dt) % TAU + TAU) % TAU;
+    const onRunway = p.y + HITBOX.planeRadius >= WORLD.groundY;
+    if (onRunway && Math.cos(newHeading) < 0) {
+      // Snap to the nearer horizontal. Invariant: prevHeading is already in
+      // the upper semicircle, so < π → clamp right (π/2), else left (3π/2).
+      p.heading = p.heading < Math.PI ? Math.PI / 2 : 3 * Math.PI / 2;
+    } else {
+      p.heading = newHeading;
     }
+  }
 
-    // Action button — one input, two meanings (§8.2.1). Uses `s` per §14.1
-    // (P1 action); the P2 key `k` wires in at T5.2.
-    //   grounded + !taxiCommitted → commit taxi (T3.3 applies the thrust).
-    //   grounded +  taxiCommitted → ignored; a committed taxi cannot be aborted.
-    //   airborne / stalled        → fire (edge press, plus held auto-fire
-    //                               every BULLETS.autoFireIntervalSec).
-    //   crashed                   → ignored.
-    //
-    // Stalled planes can still fire — §2 calls out the stall-to-fire-rearward
-    // trick as a legitimate advanced tool. attemptFire() gates on the 2-
-    // bullet cap (§10), spawns from the visible nose with no velocity
-    // inheritance (§10), and records the fire time so the held auto-fire
-    // loop below can pace itself.
-    function attemptFire(): boolean {
-      if (countBulletsOwnedBy(bullets, testPlane) >= BULLETS.maxPerPlane) {
-        return false;
-      }
-      const noseX = testPlane.x + PLANE_NOSE_OFFSET * Math.sin(testPlane.heading);
-      const noseY = testPlane.y - PLANE_NOSE_OFFSET * Math.cos(testPlane.heading);
-      bullets.push(spawnBullet(noseX, noseY, testPlane.heading, testPlane));
-      testPlane.lastFireAtSec = simTimeSec;
-      return true;
-    }
-
-    const airborneFiringState =
-      testPlane.state === 'airborne' || testPlane.state === 'stalled';
-
-    if (pressedKeys.has('s')) {
-      if (testPlane.state === 'grounded') {
-        if (!testPlane.taxiCommitted) {
-          testPlane.taxiCommitted = true;
+  /**
+   * Action button — one input, two meanings (§8.2.1).
+   *   grounded + !taxiCommitted → commit taxi (stepPhysics applies thrust).
+   *   grounded +  taxiCommitted → ignored; a committed taxi cannot be aborted.
+   *   airborne / stalled        → edge press fires; hold auto-fires every
+   *                               BULLETS.autoFireIntervalSec.
+   *   crashed                   → ignored.
+   *
+   * Stalled planes can still fire — §2 calls out the stall-to-fire-rearward
+   * trick as a legitimate advanced tool. Edge presses bypass the interval
+   * gate so rapid tapping can drain both rounds instantly; `attemptFire`
+   * updates `lastFireAtSec` so the held check here won't double-fire.
+   */
+  function applyActionButton(p: Plane, ctrl: Controls): void {
+    const firing = p.state === 'airborne' || p.state === 'stalled';
+    if (pressedKeys.has(ctrl.action)) {
+      if (p.state === 'grounded') {
+        if (!p.taxiCommitted) {
+          p.taxiCommitted = true;
           console.log(`[action] taxi committed at simTime=${simTimeSec.toFixed(2)}s`);
         }
-      } else if (airborneFiringState) {
-        attemptFire();
+      } else if (firing) {
+        attemptFire(p);
       }
     }
-    pressedKeys.clear();
-
-    // Held-auto-fire — action button held counts as 1 round per
-    // `BULLETS.autoFireIntervalSec`, still subject to the 2-bullet count cap.
-    // Edge presses above bypass the interval gate, so rapid tapping can drain
-    // both rounds instantly; only the "hold the button and forget" case paces
-    // itself at 1/s. Not in PROMPT.md §10 as of v4.3 — flagged at config.
     if (
-      airborneFiringState &&
-      keys['s'] &&
-      simTimeSec - testPlane.lastFireAtSec >= BULLETS.autoFireIntervalSec
+      firing &&
+      keys[ctrl.action] &&
+      simTimeSec - p.lastFireAtSec >= BULLETS.autoFireIntervalSec
     ) {
-      attemptFire();
+      attemptFire(p);
     }
+  }
 
-    if (testPlane.state === 'grounded' && testPlane.taxiCommitted) {
-      // Runway taxi — §8.2, §11. Full-power acceleration along heading; the
-      // plane is on the runway surface, so pitch coupling / gravity don't
-      // apply. Drag is the only resistance, matching the airborne level-flight
-      // formula with cos(heading)=0. Heading stays fixed at spawn value while
-      // grounded (rotation input gated above), so vy stays 0 and y is
-      // preserved on the runway surface. Lift-off fires when airspeed passes
-      // liftOffThreshold — at that instant bullet-immunity also ends (§10),
-      // which other modules key off `state !== 'grounded'` for free.
-      const speed = Math.hypot(testPlane.vx, testPlane.vy);
+  /**
+   * Per-plane physics + environment collisions — taxi / airborne / stall
+   * branches, position integration, horizontal wrap (§8.5), top-of-screen
+   * clamp, tower collision (§9.6), ground crash (§9.8). Bullet collisions
+   * live in the shared bullet loop below since they affect other planes.
+   */
+  function stepPhysics(p: Plane, dt: number): void {
+    if (p.state === 'grounded' && p.taxiCommitted) {
+      // Runway taxi — §8.2, §11. Full-power accel along heading; no gravity
+      // on the surface, so drag is the only resistance. Lift-off at
+      // newSpeed > liftOffThreshold flips state → airborne; §10 grounded-
+      // immunity drops automatically once the plane climbs off the surface.
+      const speed = Math.hypot(p.vx, p.vy);
       const accel = PHYSICS.thrust - PHYSICS.drag * speed;
       let newSpeed = speed + accel * dt;
       if (newSpeed < 0) newSpeed = 0;
-      const dirX = Math.sin(testPlane.heading);
-      const dirY = -Math.cos(testPlane.heading);
-      testPlane.vx = newSpeed * dirX;
-      testPlane.vy = newSpeed * dirY;
-
+      const dirX = Math.sin(p.heading);
+      const dirY = -Math.cos(p.heading);
+      p.vx = newSpeed * dirX;
+      p.vy = newSpeed * dirY;
       if (newSpeed > PHYSICS.liftOffThreshold) {
-        testPlane.state = 'airborne';
-        testPlane.taxiCommitted = false;
+        p.state = 'airborne';
+        p.taxiCommitted = false;
       }
-    } else if (testPlane.state === 'airborne') {
-      // Airborne physics — §8.2, §8.3. Velocity stays aligned with heading.
-      // Pitch coupling handles gravity's only effect while airborne:
-      //   accel along heading = thrust − drag·speed − climbPenalty·g·cos(heading)
-      const speed = Math.hypot(testPlane.vx, testPlane.vy);
+    } else if (p.state === 'airborne') {
+      // Airborne physics — §8.2, §8.3. Velocity stays aligned with heading;
+      // pitch coupling handles gravity's effect:
+      //   accel = thrust − drag·speed − climbPenalty·g·cos(heading)
+      const speed = Math.hypot(p.vx, p.vy);
       const accel =
         PHYSICS.thrust -
         PHYSICS.drag * speed -
-        PHYSICS.climbPenaltyMultiplier * PHYSICS.gravity * Math.cos(testPlane.heading);
+        PHYSICS.climbPenaltyMultiplier * PHYSICS.gravity * Math.cos(p.heading);
       let newSpeed = speed + accel * dt;
       if (newSpeed < 0) newSpeed = 0;
       if (newSpeed > PHYSICS.maxAirspeed) newSpeed = PHYSICS.maxAirspeed;
-
-      const dirX = Math.sin(testPlane.heading);
-      const dirY = -Math.cos(testPlane.heading);
-      testPlane.vx = newSpeed * dirX;
-      testPlane.vy = newSpeed * dirY;
-
-      // Stall triggers — §8.4. Either condition drops the plane into stall
-      // state; velocity is preserved by simply not touching vx/vy here, and
-      // rotation keeps working because it's handled above the state branch.
-      //   (a) airspeed falls below PHYSICS.stallThreshold
-      //   (b) the plane enters the top-of-screen stall zone (§2.1 top 5%)
-      if (
-        newSpeed < PHYSICS.stallThreshold ||
-        testPlane.y < WORLD.ceilingStallY
-      ) {
-        testPlane.state = 'stalled';
+      const dirX = Math.sin(p.heading);
+      const dirY = -Math.cos(p.heading);
+      p.vx = newSpeed * dirX;
+      p.vy = newSpeed * dirY;
+      // Stall triggers — §8.4. (a) airspeed < stallThreshold, or (b) plane
+      // enters the top-of-screen zone (§2.1 top ~5%).
+      if (newSpeed < PHYSICS.stallThreshold || p.y < WORLD.ceilingStallY) {
+        p.state = 'stalled';
       }
-    } else if (testPlane.state === 'stalled') {
-      // Stalled — thrust disabled, gravity acts, drag continues. Rotation is
-      // still under player control (handled above).
-      const ax = -PHYSICS.drag * testPlane.vx;
-      const ay = -PHYSICS.drag * testPlane.vy + PHYSICS.gravity;
-      testPlane.vx += ax * dt;
-      testPlane.vy += ay * dt;
-
-      // Recovery — §8.4. Both must hold: nose pointing within tolerance of
-      // straight-down (180°) AND airspeed above stallThreshold. The pilot's
-      // job during stall is to dive to rebuild speed with the nose planted
-      // down. On recovery the next airborne tick realigns velocity to heading.
-      const pitchFromDown = Math.abs(testPlane.heading - Math.PI);
-      const speedAfter = Math.hypot(testPlane.vx, testPlane.vy);
+    } else if (p.state === 'stalled') {
+      // Stalled — thrust off, gravity acts, drag continues. Rotation still
+      // responds (handled by applyRotationInput above).
+      const ax = -PHYSICS.drag * p.vx;
+      const ay = -PHYSICS.drag * p.vy + PHYSICS.gravity;
+      p.vx += ax * dt;
+      p.vy += ay * dt;
+      // Recovery — §8.4. Nose within tolerance of straight-down AND airspeed
+      // above stallThreshold. Next airborne tick realigns velocity to heading.
+      const pitchFromDown = Math.abs(p.heading - Math.PI);
+      const speedAfter = Math.hypot(p.vx, p.vy);
       if (
         pitchFromDown <= PHYSICS.stallRecoveryPitchTolerance &&
         speedAfter > PHYSICS.stallThreshold
       ) {
-        testPlane.state = 'airborne';
+        p.state = 'airborne';
       }
     }
 
-    testPlane.x += testPlane.vx * dt;
-    testPlane.y += testPlane.vy * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
 
-    // Horizontal wrap — §8.5. Centre-based: when the plane's centre crosses
-    // the left/right edge, teleport to the opposite edge; altitude, velocity
-    // and heading are preserved. At PHYSICS.maxAirspeed * dt ≈ 11.7 u/frame,
-    // a plane can't skip past a full WORLD.width (1920) in one step.
-    if (testPlane.x < 0) testPlane.x += WORLD.width;
-    else if (testPlane.x >= WORLD.width) testPlane.x -= WORLD.width;
+    // Horizontal wrap — §8.5. Centre-based; altitude / velocity / heading
+    // preserved. PHYSICS.maxAirspeed * dt ≈ 11.7 u per step ≪ WORLD.width.
+    if (p.x < 0) p.x += WORLD.width;
+    else if (p.x >= WORLD.width) p.x -= WORLD.width;
 
-    // Top-of-screen hard clamp (non-fatal). The ceiling stall triggers at
-    // WORLD.ceilingStallY, but upward momentum can still carry a stalled
-    // plane past y=0. Clamp centre at 0 and zero any remaining upward vy so
-    // gravity takes over immediately. No crash — just a wall.
-    if (testPlane.y < 0) {
-      testPlane.y = 0;
-      if (testPlane.vy < 0) testPlane.vy = 0;
+    // Top-of-screen hard clamp (non-fatal): ceiling stall already triggered,
+    // but upward momentum can still carry a stalled plane past y=0. Clamp
+    // centre at 0 and zero any upward vy so gravity takes over immediately.
+    if (p.y < 0) {
+      p.y = 0;
+      if (p.vy < 0) p.vy = 0;
     }
 
-    // Tower collision — §9.6, §9.7. Plane circle vs tower AABB. Fires in any
-    // non-crashed state: airborne/stalled flights into the side or top, and
-    // the taxiing plane that runs out of runway before lift-off (the §11
-    // auto-start punishment). Closest-point-on-AABB / squared-distance test
-    // avoids a sqrt. Strict `<` so tangent contact isn't a crash — matches
-    // the ground-crash convention introduced in T3.3.
-    if (testPlane.state !== 'crashed') {
+    // Tower collision — §9.6, §9.7. Plane circle vs tower AABB. Fires in
+    // any non-crashed state. Closest-point-on-AABB squared-distance test.
+    // Strict `<` so tangent contact isn't a crash — same convention as the
+    // ground check below.
+    if (p.state !== 'crashed') {
       const towerLeft = TOWER.centreX - TOWER.width / 2;
       const towerRight = TOWER.centreX + TOWER.width / 2;
-      const cx = Math.max(towerLeft, Math.min(testPlane.x, towerRight));
-      const cy = Math.max(TOWER.topY, Math.min(testPlane.y, WORLD.groundY));
-      const dx = testPlane.x - cx;
-      const dy = testPlane.y - cy;
+      const cx = Math.max(towerLeft, Math.min(p.x, towerRight));
+      const cy = Math.max(TOWER.topY, Math.min(p.y, WORLD.groundY));
+      const dx = p.x - cx;
+      const dy = p.y - cy;
       if (dx * dx + dy * dy < HITBOX.planeRadius * HITBOX.planeRadius) {
-        crashPlane(testPlane, 'tower contact');
+        crashPlane(p, 'tower contact');
       }
     }
 
-    // Ground crash — §9.8. Airborne or stalled plane whose hitbox penetrates
-    // the runway surface crashes. Strict-`>` (not `>=`) so that the instant
-    // after lift-off, when the hitbox is still tangent to the runway, the
-    // plane doesn't immediately re-crash. A real dive into the ground still
-    // fires the event on the next tick once y advances past the surface.
-    // Fires the crash event once (state transitions to 'crashed'); subsequent
-    // frames don't re-fire because physics is skipped in 'crashed' state.
-    // Respawn / explosion animation land in T3.5 / T11.1.
+    // Ground crash — §9.8. Strict-`>` so a just-lifted plane with hitbox
+    // tangent to the runway doesn't insta-crash. Pin wreck on the surface
+    // before flipping state — ground is the one crash site that needs a
+    // position fix-up.
     if (
-      (testPlane.state === 'airborne' || testPlane.state === 'stalled') &&
-      testPlane.y + HITBOX.planeRadius > WORLD.groundY
+      (p.state === 'airborne' || p.state === 'stalled') &&
+      p.y + HITBOX.planeRadius > WORLD.groundY
     ) {
-      // Pin the wreck on the runway surface before the helper flips state —
-      // ground crashes are the one site that needs a position fix-up (tower /
-      // bullet leave the wreck wherever the impact happened).
-      testPlane.y = WORLD.groundY - HITBOX.planeRadius;
-      crashPlane(testPlane, 'ground contact');
+      p.y = WORLD.groundY - HITBOX.planeRadius;
+      crashPlane(p, 'ground contact');
+    }
+  }
+
+  function update(dt: number): void {
+    // While a match is over the sim freezes — the result screen renders on
+    // top of the last frame and the only live input is "play again" (§12).
+    if (matchOver) return;
+    simSteps++;
+    simTimeSec += dt;
+
+    // Time-based triggers (both planes) before inputs fire, so a respawning
+    // plane's state is already 'grounded' by the time input runs this tick.
+    for (const p of planes) {
+      handleRespawn(p, dt);
+      handleAutoStart(p, dt);
+    }
+
+    // Human input, one plane per binding. Both planes read `pressedKeys`
+    // before it's cleared below, so same-tick presses by both players each
+    // get their edge seen exactly once.
+    for (let i = 0; i < planes.length; i++) {
+      const p = planes[i]!;
+      const ctrl = controls[i];
+      if (!ctrl) continue; // AI pilots land in T6.
+      applyRotationInput(p, ctrl, dt);
+      applyActionButton(p, ctrl);
+    }
+    pressedKeys.clear();
+
+    // Per-plane physics + environment collisions.
+    for (const p of planes) stepPhysics(p, dt);
+
+    // Plane-plane mid-air collision — §9.3 Close Quarters, §9.5 ground
+    // exemption. With 2 planes we're in Close Quarters: any pair whose
+    // hitboxes overlap *in the air* crashes both. §9.5: planes on the
+    // runway (hitbox in contact with surface) don't collide — taxi stacking
+    // is allowed. The moment either plane lifts off, air rules apply.
+    //
+    // At max airspeed (700 u/s) the per-tick relative motion between a pair
+    // is ≤ 2·(700·dt) ≈ 23 u, well under 2·planeRadius = 40 u, so a static
+    // end-of-tick circle-circle test catches every overlap without a swept
+    // capsule. Dogfight-mode pass-through (≥ 5 planes, §9.3 / §9.4) wires
+    // in at T8.3, with the ghost-through visual telegraph at T8.5.
+    const minRamDistSq = (2 * HITBOX.planeRadius) * (2 * HITBOX.planeRadius);
+    for (let i = 0; i < planes.length; i++) {
+      const a = planes[i]!;
+      if (a.state === 'crashed') continue;
+      if (a.y + HITBOX.planeRadius >= WORLD.groundY) continue;
+      for (let j = i + 1; j < planes.length; j++) {
+        const b = planes[j]!;
+        if (b.state === 'crashed') continue;
+        if (b.y + HITBOX.planeRadius >= WORLD.groundY) continue;
+        const dx = a.x - b.x;
+        const dy = a.y - b.y;
+        if (dx * dx + dy * dy < minRamDistSq) {
+          crashPlane(a, `ram vs P${j + 1}`);
+          crashPlane(b, `ram vs P${i + 1}`);
+        }
+      }
     }
 
     // Bullet motion + swept-segment plane collision — §9.7, §10, T4.4.
@@ -485,7 +610,7 @@ function init(): void {
     //   4. Self-kill allowed (§10) — owner is not excluded from the test.
     //   5. On hit: crash the plane (one-shot), consume the bullet.
     //   6. Safety lifetime reap until T4.3 lands the real edge-expiry rule.
-    const planesForCollision: Plane[] = [testPlane];
+    const planesForCollision: Plane[] = planes;
     for (let i = bullets.length - 1; i >= 0; i--) {
       const b = bullets[i]!;
       b.prevX = b.x;
@@ -561,6 +686,27 @@ function init(): void {
         bullets.splice(i, 1);
       }
     }
+
+    // Match-end detection — §12. Ran after every crash source for the tick
+    // has resolved (plane-plane ram + bullet hits) so simultaneous last-life
+    // eliminations resolve as a draw rather than a race between kill sources.
+    // 0 alive → draw; 1 alive → that plane wins; 2+ alive → keep playing.
+    // `lives > 0` is the "still in match" predicate: a plane crashed with
+    // lives > 0 is mid-respawn; a plane with lives = 0 is permanently out.
+    let aliveCount = 0;
+    let aliveIndex = -1;
+    for (let i = 0; i < planes.length; i++) {
+      if (planes[i]!.lives > 0) {
+        aliveCount++;
+        aliveIndex = i;
+      }
+    }
+    if (aliveCount <= 1) {
+      matchOver = true;
+      matchOutcome =
+        aliveCount === 0 ? 'draw' : aliveIndex === 0 ? 'P1' : 'P2';
+      console.log(`[match] ${matchOutcome === 'draw' ? 'DRAW' : matchOutcome + ' WINS'}`);
+    }
   }
 
   function render(): void {
@@ -574,13 +720,17 @@ function init(): void {
     ctx.scale(viewport.scale, viewport.scale);
 
     drawArena(ctx);
-    drawPlane(ctx, testPlane);
-    // Wrap-ghost: render a second copy at the opposite edge while the sprite
-    // straddles the left/right boundary, so the crossing is visually seamless.
-    if (testPlane.x < PLANE_SPRITE_EXTENT) {
-      drawPlane(ctx, testPlane, WORLD.width);
-    } else if (testPlane.x > WORLD.width - PLANE_SPRITE_EXTENT) {
-      drawPlane(ctx, testPlane, -WORLD.width);
+    for (const p of planes) {
+      drawPlane(ctx, p);
+      // Wrap-ghost: render a second copy at the opposite edge while the
+      // sprite straddles the left/right boundary so the crossing looks
+      // seamless (§8.5). Runway planes never straddle, so this is a no-op
+      // for grounded planes but costs nothing to check.
+      if (p.x < PLANE_SPRITE_EXTENT) {
+        drawPlane(ctx, p, WORLD.width);
+      } else if (p.x > WORLD.width - PLANE_SPRITE_EXTENT) {
+        drawPlane(ctx, p, -WORLD.width);
+      }
     }
 
     // Bullets render above planes so a round passing in front of a plane
@@ -590,25 +740,122 @@ function init(): void {
     ctx.fillStyle = '#fff';
     ctx.font = '28px system-ui, sans-serif';
     ctx.textAlign = 'left';
-    ctx.fillText('Carnage v4.0 — T4.6 grounded immunity', 32, 48);
+    ctx.fillText('Carnage v4.0 — T5.5 match end + play again', 32, 48);
 
     ctx.textAlign = 'right';
-    const headingDeg = (testPlane.heading * 180) / Math.PI;
-    const speedValue = Math.hypot(testPlane.vx, testPlane.vy);
-    const altitude = WORLD.groundY - testPlane.y;
     ctx.fillText(`frames:    ${frameCount}`, WORLD.width - 32, 48);
     ctx.fillText(`sim steps: ${simSteps}`, WORLD.width - 32, 80);
     ctx.fillText(`sim time:  ${simTimeSec.toFixed(2)}s`, WORLD.width - 32, 112);
-    ctx.fillText(`heading:   ${headingDeg.toFixed(1)}°`, WORLD.width - 32, 144);
-    ctx.fillText(`speed:     ${speedValue.toFixed(1)} u/s`, WORLD.width - 32, 176);
-    ctx.fillText(`altitude:  ${altitude.toFixed(0)}`, WORLD.width - 32, 208);
-    ctx.fillText(`state:     ${testPlane.state}`, WORLD.width - 32, 240);
-    ctx.fillText(`taxi:      ${testPlane.taxiCommitted ? 'committed' : 'idle'}`, WORLD.width - 32, 272);
-    ctx.fillText(`bullets:   ${bullets.length}`, WORLD.width - 32, 336);
-    if (testPlane.state === 'crashed') {
-      ctx.fillText(`respawn:   ${testPlane.respawnTimerSec.toFixed(2)}s`, WORLD.width - 32, 304);
-    } else if (testPlane.state === 'grounded' && !testPlane.taxiCommitted) {
-      ctx.fillText(`auto-start: ${testPlane.autoStartTimerSec.toFixed(2)}s`, WORLD.width - 32, 304);
+    ctx.fillText(`bullets:   ${bullets.length}`, WORLD.width - 32, 144);
+
+    // Two per-plane diagnostic columns: P1 on the left (mirrors its runway
+    // side), P2 on the right. Transient debug layout until T5.4 lands the
+    // real HUD with lives + match state.
+    function drawPlaneStats(label: string, p: Plane, x: number, align: CanvasTextAlign): void {
+      ctx.textAlign = align;
+      const headingDeg = (p.heading * 180) / Math.PI;
+      const speedValue = Math.hypot(p.vx, p.vy);
+      const altitude = WORLD.groundY - p.y;
+      ctx.fillStyle = p.color;
+      ctx.fillText(label, x, 224);
+      ctx.fillStyle = '#fff';
+      ctx.fillText(`state:     ${p.state}`, x, 256);
+      ctx.fillText(`taxi:      ${p.taxiCommitted ? 'committed' : 'idle'}`, x, 288);
+      ctx.fillText(`heading:   ${headingDeg.toFixed(1)}°`, x, 320);
+      ctx.fillText(`speed:     ${speedValue.toFixed(1)} u/s`, x, 352);
+      ctx.fillText(`altitude:  ${altitude.toFixed(0)}`, x, 384);
+      if (p.state === 'crashed') {
+        ctx.fillText(`respawn:   ${p.respawnTimerSec.toFixed(2)}s`, x, 416);
+      } else if (p.state === 'grounded' && !p.taxiCommitted) {
+        ctx.fillText(`auto-start:${p.autoStartTimerSec.toFixed(2)}s`, x, 416);
+      }
+    }
+    drawPlaneStats('P1 (A/S/D)', plane1, 32, 'left');
+    drawPlaneStats('P2 (J/K/L)', plane2, WORLD.width - 32, 'right');
+
+    // Per-player lives in the bottom HUD strip — §7, §12, §16.3. Label +
+    // row of pips, coloured with the plane's signature colour. Pips spread
+    // away from the label, so lost lives fall off the far side and the
+    // remaining count clusters near the player's identity label. Total pip
+    // count is fixed at `MATCH.startingLives`; dim/outlined pips are lost,
+    // solid pips are remaining.
+    const hudCentreY = WORLD.groundY + WORLD.hudHeight / 2;
+    function drawLivesHud(label: string, p: Plane, x: number, align: CanvasTextAlign): void {
+      ctx.save();
+      ctx.font = 'bold 36px system-ui, sans-serif';
+      ctx.textAlign = align;
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = p.color;
+      ctx.fillText(label, x, hudCentreY);
+
+      const labelPad = 120;
+      const pipRadius = 10;
+      const pipGap = 28;
+      const dirSign = align === 'left' ? 1 : -1;
+      const pipStartX = x + dirSign * labelPad;
+      for (let i = 0; i < MATCH.startingLives; i++) {
+        const cx = pipStartX + dirSign * i * pipGap;
+        ctx.beginPath();
+        ctx.arc(cx, hudCentreY, pipRadius, 0, Math.PI * 2);
+        if (i < p.lives) {
+          ctx.fillStyle = p.color;
+          ctx.fill();
+        } else {
+          ctx.fillStyle = '#1a1a1a';
+          ctx.fill();
+          ctx.strokeStyle = p.color;
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+    drawLivesHud('P1', plane1, 32, 'left');
+    drawLivesHud('P2', plane2, WORLD.width - 32, 'right');
+
+    // Result overlay — §12, T5.5. Drawn last so it sits above planes,
+    // bullets and HUD. Dim the sky (not the HUD strip — lives + bottom bar
+    // stay legible so the player can see the final score), name the winner
+    // in their signature colour, and show a Play Again button as the visual
+    // affordance. Click anywhere on canvas OR Enter / Space restarts.
+    if (matchOver) {
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+      ctx.fillRect(0, 0, WORLD.width, WORLD.groundY);
+
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const winMsg =
+        matchOutcome === 'draw'
+          ? 'DRAW'
+          : `${matchOutcome} WINS`;
+      const winColor =
+        matchOutcome === 'P1' ? plane1.color
+        : matchOutcome === 'P2' ? plane2.color
+        : '#ffffff';
+      ctx.fillStyle = winColor;
+      ctx.font = 'bold 120px system-ui, sans-serif';
+      ctx.fillText(winMsg, WORLD.width / 2, WORLD.height * 0.32);
+
+      const btnW = 440;
+      const btnH = 104;
+      const btnX = WORLD.width / 2 - btnW / 2;
+      const btnY = WORLD.height * 0.52;
+      ctx.fillStyle = '#a89268';
+      ctx.fillRect(btnX, btnY, btnW, btnH);
+      ctx.strokeStyle = '#2a2014';
+      ctx.lineWidth = STROKE.emphasis;
+      ctx.strokeRect(btnX, btnY, btnW, btnH);
+      ctx.fillStyle = '#2a2014';
+      ctx.font = 'bold 56px system-ui, sans-serif';
+      ctx.fillText('PLAY AGAIN', WORLD.width / 2, btnY + btnH / 2);
+
+      ctx.fillStyle = '#e8e8e8';
+      ctx.font = '28px system-ui, sans-serif';
+      ctx.fillText(
+        'click the button or press Enter / Space',
+        WORLD.width / 2,
+        btnY + btnH + 56,
+      );
     }
 
     ctx.restore();
