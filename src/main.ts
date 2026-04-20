@@ -5,7 +5,7 @@ import {
   spawnBullet,
   type Bullet,
 } from './bullet';
-import { BULLETS, HITBOX, MATCH, PHYSICS, STROKE, TOWER, WORLD } from './config';
+import { BULLETS, HITBOX, MATCH, PHYSICS, PLAYERS, STROKE, TOWER, WORLD } from './config';
 import { startLoop } from './loop';
 import {
   drawPlane,
@@ -216,14 +216,22 @@ function init(): void {
   const pressedKeys = new Set<string>();
   window.addEventListener('keydown', (ev) => {
     const k = ev.key.toLowerCase();
-    // Result screen shortcut: Enter / Space restarts (§12 play-again). Keys
-    // are not routed into the sim while frozen — matchOver already early-
-    // returns in update() but blocking the press here stops stale keystate
-    // from bleeding into the next match.
-    if (matchOver && (k === 'enter' || k === ' ')) {
-      ev.preventDefault();
-      resetMatch();
-      return;
+    // UI shortcuts for Enter / Space on screens that freeze the sim.
+    //   setup screen  → Start a match (only when the combo is valid).
+    //   result screen → Return to setup (§13.3 "play again" re-enters setup).
+    // Handled before the key-tracking path so these presses don't linger
+    // as stale state for the next match.
+    if (k === 'enter' || k === ' ') {
+      if (gameState === 'setup') {
+        ev.preventDefault();
+        if (setupIsValid()) startMatch();
+        return;
+      }
+      if (matchOver) {
+        ev.preventDefault();
+        exitToSetup();
+        return;
+      }
     }
     if (!ev.repeat) pressedKeys.add(k);
     keys[k] = true;
@@ -231,11 +239,48 @@ function init(): void {
   window.addEventListener('keyup', (ev) => {
     keys[ev.key.toLowerCase()] = false;
   });
-  // Click anywhere on the canvas while the result screen is up restarts —
-  // the Play Again button is the visual affordance, but a click anywhere
-  // counts (forgiving for touch / mobile when those land at T10).
-  canvas.addEventListener('click', () => {
-    if (matchOver) resetMatch();
+  // Click routing per screen — buttons draw at specific rects but the
+  // hit-test is forgiving enough that clicking near-but-not-on still works.
+  canvas.addEventListener('click', (ev) => {
+    const rect = canvas.getBoundingClientRect();
+    const screenX = (ev.clientX - rect.left) * (canvas.width / rect.width);
+    const screenY = (ev.clientY - rect.top) * (canvas.height / rect.height);
+    const logicalX = (screenX - viewport.offsetX) / viewport.scale;
+    const logicalY = (screenY - viewport.offsetY) / viewport.scale;
+    if (gameState === 'setup') {
+      // Humans selector.
+      for (const v of [1, 2] as const) {
+        if (hitTestButton(logicalX, logicalY, humansBtnRect(v))) {
+          setHumansChoice(v);
+          return;
+        }
+      }
+      // AI count selector — skip disabled values silently.
+      for (let v = 0; v <= 7; v++) {
+        if (aiCountDisabled(v)) continue;
+        if (hitTestButton(logicalX, logicalY, aiBtnRect(v))) {
+          setupAi = v;
+          return;
+        }
+      }
+      // Difficulty selector — skip disabled tiers.
+      for (const d of ['easy', 'medium', 'hard'] as const) {
+        if (difficultyDisabled(d)) continue;
+        if (hitTestButton(logicalX, logicalY, difficultyBtnRect(d))) {
+          setupDifficulty = d;
+          return;
+        }
+      }
+      // START — only fires when the combination is in-range.
+      if (setupIsValid() && hitTestButton(logicalX, logicalY, SETUP_START_BUTTON)) {
+        startMatch();
+      }
+      return;
+    }
+    if (matchOver) {
+      if (hitTestButton(logicalX, logicalY, RESULT_PLAY_AGAIN_BUTTON)) exitToSetup();
+      return;
+    }
   });
 
   // Per-plane pilot assignment, index-aligned with `planes` (§15.1). Every
@@ -282,8 +327,12 @@ function init(): void {
     : p2Mode === 'ai-stub' ? new AiPilotStub()
     : new AiPilotMedium();
   const pilots: Array<Pilot | null> = [p1Pilot, p2Pilot];
+  // Dev back-door: if any URL pilot flag is set, bypass the setup screen
+  // and go straight to the match. Primarily for AI-vs-AI observation runs
+  // (T6.3 acceptance). The setup UI becomes the source of truth otherwise.
+  const skipSetupViaUrl = params.has('p1') || params.has('p2');
   console.log(
-    `[init] P1 pilot: ${pilots[0]?.label ?? '—'} · P2 pilot: ${pilots[1]?.label ?? '—'}`,
+    `[init] P1 pilot: ${pilots[0]?.label ?? '—'} · P2 pilot: ${pilots[1]?.label ?? '—'}${skipSetupViaUrl ? ' (URL override — skipping setup)' : ''}`,
   );
   const world: World = { planes, bullets };
 
@@ -291,12 +340,127 @@ function init(): void {
   let simSteps = 0;
   let simTimeSec = 0;
 
+  // Top-level game state — §13. Setup screen precedes every match; the match
+  // freezes on end (existing §12 behaviour) and the result screen's Play
+  // Again button drops back to setup per §13.3 rather than starting a new
+  // match in place. URL pilot override bypasses setup entirely.
+  let gameState: 'setup' | 'match' = skipSetupViaUrl ? 'match' : 'setup';
+
+  // Setup selectors — §13.1, T7.2. Defaults per §13.3: 1 human + 1 medium
+  // AI. Session persistence (§13.3, T7.5) is free here because these vars
+  // live in init()'s closure — they're only mutated by user clicks in the
+  // setup handler, and never reset by `resetMatch`, `exitToSetup`, or
+  // `startMatch`. Play Again → exitToSetup → renderSetup reads the same
+  // values the player last picked. Page reload starts fresh per spec
+  // (no cross-session storage in v1). The interim plane-count cap is 2
+  // until T8 scales N-plane support; selector values that would exceed
+  // the cap are shown greyed (per §5 interim-build note) and Start is
+  // disabled when the combination is out of range.
+  type Difficulty = 'easy' | 'medium' | 'hard';
+  let setupHumans: 1 | 2 = 1;
+  let setupAi = 1;
+  let setupDifficulty: Difficulty = 'medium';
+
+  const MAX_TOTAL_PLANES_CURRENT = 2; // raised to 8 at T8
+  const MIN_TOTAL_PLANES = 2;
+
+  function setupTotalPlanes(): number {
+    return setupHumans + setupAi;
+  }
+  function setupIsValid(): boolean {
+    const t = setupTotalPlanes();
+    return t >= MIN_TOTAL_PLANES && t <= MAX_TOTAL_PLANES_CURRENT;
+  }
+  function aiCountDisabled(v: number): boolean {
+    const t = setupHumans + v;
+    return t < MIN_TOTAL_PLANES || t > MAX_TOTAL_PLANES_CURRENT;
+  }
+  function difficultyDisabled(d: Difficulty): boolean {
+    // Only medium wired today (§5 interim-build). T9 unlocks easy/hard.
+    return d !== 'medium';
+  }
+
+  /** Collision-mode descriptor for a given plane count — §9.3 / §13.2. */
+  function collisionModeFor(count: number): {
+    name: string;
+    rule: string;
+    explanation: string;
+  } {
+    if (count >= PLAYERS.dogfightModeMinPlanes) {
+      return {
+        name: 'Dogfight',
+        rule: 'Bullets Only',
+        explanation: 'Planes pass through each other. Only bullets kill.',
+      };
+    }
+    return {
+      name: 'Close Quarters',
+      rule: 'Ramming ON',
+      explanation: 'Mid-air collisions destroy both planes.',
+    };
+  }
+  function setHumansChoice(h: 1 | 2): void {
+    setupHumans = h;
+    // Clamp AI count back into valid range — avoids stale invalid combo
+    // lingering after the user edits humans.
+    const minValid = Math.max(0, MIN_TOTAL_PLANES - h);
+    const maxValid = Math.max(0, MAX_TOTAL_PLANES_CURRENT - h);
+    if (setupAi < minValid) setupAi = minValid;
+    if (setupAi > maxValid) setupAi = maxValid;
+  }
+
+  // Selector button rect helpers — positions derived relative to the
+  // Controls panel (x=320, y=340, w=560, h=380). All share a common
+  // x-center at 600 (panel midpoint).
+  function humansBtnRect(v: 1 | 2): ButtonRect {
+    return { x: 510 + (v - 1) * 100, y: 395, w: 80, h: 50 };
+  }
+  function aiBtnRect(v: number): ButtonRect {
+    return { x: 365 + v * 60, y: 495, w: 50, h: 50 };
+  }
+  function difficultyBtnRect(d: Difficulty): ButtonRect {
+    const idx = d === 'easy' ? 0 : d === 'medium' ? 1 : 2;
+    return { x: 410 + idx * 130, y: 600, w: 120, h: 50 };
+  }
+
   // Match lifecycle — §12. `matchOver` freezes the sim and shows the result
   // screen; `matchOutcome` records who won (or draw for simultaneous last-
-  // life eliminations). Cleared by `resetMatch` when the player hits Play
-  // Again.
+  // life eliminations). Cleared by `resetMatch` when the player hits Start.
   let matchOver = false;
   let matchOutcome: 'P1' | 'P2' | 'draw' | null = null;
+
+  /**
+   * Shared button-rect record so render, hit-test, and keyboard shortcuts
+   * agree on where each clickable lives. Logical coordinates (pre-viewport
+   * transform); the click handler maps screen → logical before testing.
+   */
+  interface ButtonRect {
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  }
+  const SETUP_START_BUTTON: ButtonRect = {
+    x: WORLD.width / 2 - 220,
+    y: WORLD.height * 0.78,
+    w: 440,
+    h: 104,
+  };
+  const RESULT_PLAY_AGAIN_BUTTON: ButtonRect = {
+    x: WORLD.width / 2 - 220,
+    y: WORLD.height * 0.52,
+    w: 440,
+    h: 104,
+  };
+
+  function hitTestButton(logicalX: number, logicalY: number, btn: ButtonRect): boolean {
+    return (
+      logicalX >= btn.x &&
+      logicalX <= btn.x + btn.w &&
+      logicalY >= btn.y &&
+      logicalY <= btn.y + btn.h
+    );
+  }
 
   /**
    * Reset every plane to its spawn pose with full lives, clear all bullets
@@ -318,14 +482,34 @@ function init(): void {
       p.lives = MATCH.startingLives;
     }
     bullets.length = 0;
-    // Flush any input collected while the result screen was up so it can't
-    // bleed into the first tick of the new match (held rotation keys, a
-    // stray taxi-commit press during result-screen fiddling, etc.).
+    // Flush any input collected while the result / setup screen was up so
+    // it can't bleed into the first tick of the new match (held rotation
+    // keys, a stray taxi-commit press during result-screen fiddling, etc.).
     pressedKeys.clear();
     for (const k of Object.keys(keys)) delete keys[k];
     matchOver = false;
     matchOutcome = null;
     console.log('[match] reset — new match');
+  }
+
+  function startMatch(): void {
+    // Apply the current setup selections to the pilots array. P1 is always
+    // keyboard-human when humans ≥ 1; P2 becomes the second keyboard human
+    // if `setupHumans === 2`, otherwise the AI medium pilot. `difficulty`
+    // will differentiate AI tiers once T9 adds easy/hard pilot classes —
+    // for now medium is the only wired tier and selection is a no-op.
+    pilots[0] = makeHumanPilot({ ccw: 'a', action: 's', cw: 'd' });
+    pilots[1] = setupHumans === 2
+      ? makeHumanPilot({ ccw: 'j', action: 'k', cw: 'l' })
+      : new AiPilotMedium();
+    resetMatch();
+    gameState = 'match';
+  }
+
+  function exitToSetup(): void {
+    gameState = 'setup';
+    // Planes stay wherever they ended up — setup screen draws over them.
+    // `startMatch` resets when the player clicks Start again.
   }
 
   /**
@@ -583,9 +767,11 @@ function init(): void {
   }
 
   function update(dt: number): void {
-    // While a match is over the sim freezes — the result screen renders on
-    // top of the last frame and the only live input is "play again" (§12).
-    if (matchOver) return;
+    // The sim only runs while a match is actively being played. Setup and
+    // match-over freezes both early-return — their screens are rendered
+    // on top of the frozen frame and input is routed to the UI, not the
+    // plane physics.
+    if (gameState === 'setup' || matchOver) return;
     simSteps++;
     simTimeSec += dt;
 
@@ -752,6 +938,187 @@ function init(): void {
     }
   }
 
+  function drawButton(
+    btn: ButtonRect,
+    label: string,
+    labelPx: number,
+    enabled = true,
+  ): void {
+    ctx.fillStyle = enabled ? '#a89268' : 'rgba(70, 70, 70, 0.5)';
+    ctx.fillRect(btn.x, btn.y, btn.w, btn.h);
+    ctx.strokeStyle = enabled ? '#2a2014' : '#555';
+    ctx.lineWidth = STROKE.emphasis;
+    ctx.strokeRect(btn.x, btn.y, btn.w, btn.h);
+    ctx.fillStyle = enabled ? '#2a2014' : '#888';
+    ctx.font = `bold ${labelPx}px system-ui, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, btn.x + btn.w / 2, btn.y + btn.h / 2);
+  }
+
+  /**
+   * Selector button — smaller/subtler than the primary START button,
+   * with three visual states: selected (full tan fill), enabled + not
+   * selected (faded tan), disabled (grey). T7.2 uses it for the humans /
+   * AI / difficulty selector rows.
+   */
+  function drawSelectorButton(
+    btn: ButtonRect,
+    label: string,
+    labelPx: number,
+    selected: boolean,
+    enabled: boolean,
+  ): void {
+    ctx.fillStyle = !enabled
+      ? 'rgba(60, 60, 60, 0.35)'
+      : selected
+        ? '#a89268'
+        : 'rgba(168, 146, 104, 0.22)';
+    ctx.fillRect(btn.x, btn.y, btn.w, btn.h);
+    ctx.strokeStyle = enabled ? '#2a2014' : '#444';
+    ctx.lineWidth = STROKE.object;
+    ctx.strokeRect(btn.x, btn.y, btn.w, btn.h);
+    ctx.fillStyle = !enabled ? '#777' : selected ? '#2a2014' : '#f0e4c8';
+    ctx.font = `${labelPx}px system-ui, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, btn.x + btn.w / 2, btn.y + btn.h / 2);
+  }
+
+  function renderSetup(): void {
+    // Flat sky-ish background so the setup screen reads as "pre-match
+    // staging" rather than an overlay on a paused game.
+    ctx.fillStyle = '#4b7fae';
+    ctx.fillRect(0, 0, WORLD.width, WORLD.height);
+
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.font = 'bold 120px system-ui, sans-serif';
+    ctx.fillText('CARNAGE v4.0', WORLD.width / 2, 180);
+    ctx.font = '48px system-ui, sans-serif';
+    ctx.fillText('Match Setup', WORLD.width / 2, 260);
+
+    // Panel frame helper.
+    function drawPanel(x: number, y: number, w: number, h: number, title: string): void {
+      ctx.fillStyle = 'rgba(20, 32, 48, 0.35)';
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = '#2e4a66';
+      ctx.lineWidth = STROKE.object;
+      ctx.strokeRect(x, y, w, h);
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 36px system-ui, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText(title, x + 24, y + 48);
+    }
+
+    // Controls panel (§13.1 selectors).
+    drawPanel(320, 340, 560, 380, 'Controls');
+
+    ctx.fillStyle = '#d6e4f2';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.font = '24px system-ui, sans-serif';
+    ctx.fillText('HUMANS', 600, 388);
+    ctx.fillText('AI OPPONENTS', 600, 488);
+    ctx.fillText('DIFFICULTY', 600, 588);
+
+    drawSelectorButton(humansBtnRect(1), '1', 30, setupHumans === 1, true);
+    drawSelectorButton(humansBtnRect(2), '2', 30, setupHumans === 2, true);
+    for (let v = 0; v <= 7; v++) {
+      drawSelectorButton(aiBtnRect(v), String(v), 26, setupAi === v, !aiCountDisabled(v));
+    }
+    drawSelectorButton(difficultyBtnRect('easy'), 'Easy', 26, setupDifficulty === 'easy', !difficultyDisabled('easy'));
+    drawSelectorButton(difficultyBtnRect('medium'), 'Medium', 26, setupDifficulty === 'medium', !difficultyDisabled('medium'));
+    drawSelectorButton(difficultyBtnRect('hard'), 'Hard', 26, setupDifficulty === 'hard', !difficultyDisabled('hard'));
+
+    // Match Info panel — §13.2. Live plane count + collision mode label
+    // + short explanation (T7.3), plus per-player control reminder (T7.4).
+    // Rendered every frame so selector edits reflect immediately. Layout
+    // is top-down single-column, packed to leave room for both sections.
+    drawPanel(1040, 340, 560, 380, 'Match Info');
+    const infoX = 1040 + 24;
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+
+    ctx.fillStyle = '#d6e4f2';
+    ctx.font = '22px system-ui, sans-serif';
+    ctx.fillText('TOTAL PLANES', infoX, 430);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 52px system-ui, sans-serif';
+    ctx.fillText(String(setupTotalPlanes()), infoX, 484);
+
+    const mode = collisionModeFor(setupTotalPlanes());
+    ctx.fillStyle = '#d6e4f2';
+    ctx.font = '22px system-ui, sans-serif';
+    ctx.fillText('COLLISION MODE', infoX, 522);
+    // Mode rule name in the tan emphasis colour so it reads as "the active
+    // rule". Explanation in the panel text colour below.
+    ctx.fillStyle = '#ffd27a';
+    ctx.font = 'bold 26px system-ui, sans-serif';
+    ctx.fillText(`${mode.name} — ${mode.rule}`, infoX, 556);
+    ctx.fillStyle = '#d6e4f2';
+    ctx.font = '20px system-ui, sans-serif';
+    ctx.fillText(mode.explanation, infoX, 584);
+
+    // Per-player control reminder — §13.2, T7.4. Label each row with the
+    // plane's signature colour (matches the in-match HUD pips) so the map
+    // ties cleanly to who-is-who. P2 shows keys when human, pilot label
+    // when AI; mobile touch reminders land at T10.5.
+    ctx.fillStyle = '#d6e4f2';
+    ctx.font = '22px system-ui, sans-serif';
+    ctx.fillText('CONTROLS', infoX, 622);
+
+    const rowAnnotation = '(rotate · action · rotate)';
+    const keyColX = infoX + 56;
+    const noteColX = infoX + 172;
+
+    function drawControlRow(
+      label: string,
+      labelColor: string,
+      keys: string,
+      note: string | null,
+      y: number,
+    ): void {
+      ctx.font = 'bold 26px system-ui, sans-serif';
+      ctx.fillStyle = labelColor;
+      ctx.fillText(label, infoX, y);
+      ctx.font = 'bold 24px system-ui, sans-serif';
+      ctx.fillStyle = '#fff';
+      ctx.fillText(keys, keyColX, y);
+      if (note !== null) {
+        ctx.font = '18px system-ui, sans-serif';
+        ctx.fillStyle = '#a0b4c8';
+        ctx.fillText(note, noteColX, y);
+      }
+    }
+
+    drawControlRow('P1', plane1.color, 'A  S  D', rowAnnotation, 656);
+    if (setupHumans === 2) {
+      drawControlRow('P2', plane2.color, 'J  K  L', rowAnnotation, 690);
+    } else {
+      drawControlRow('P2', plane2.color, `AI (${setupDifficulty})`, null, 690);
+    }
+
+    // START button — disabled when combination is out of §13.1 range.
+    const startEnabled = setupIsValid();
+    drawButton(SETUP_START_BUTTON, 'START', 56, startEnabled);
+
+    ctx.fillStyle = startEnabled ? '#d6e4f2' : '#d67a7a';
+    ctx.font = '28px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(
+      startEnabled
+        ? 'click START or press Enter / Space'
+        : `total planes ${setupTotalPlanes()} — valid range ${MIN_TOTAL_PLANES}–${MAX_TOTAL_PLANES_CURRENT}`,
+      WORLD.width / 2,
+      SETUP_START_BUTTON.y + SETUP_START_BUTTON.h + 56,
+    );
+  }
+
   function render(): void {
     frameCount++;
 
@@ -761,6 +1128,12 @@ function init(): void {
     ctx.save();
     ctx.translate(viewport.offsetX, viewport.offsetY);
     ctx.scale(viewport.scale, viewport.scale);
+
+    if (gameState === 'setup') {
+      renderSetup();
+      ctx.restore();
+      return;
+    }
 
     drawArena(ctx);
     for (const p of planes) {
@@ -783,7 +1156,7 @@ function init(): void {
     ctx.fillStyle = '#fff';
     ctx.font = '28px system-ui, sans-serif';
     ctx.textAlign = 'left';
-    ctx.fillText('Carnage v4.0 — T6.3 AI obstacle avoidance', 32, 48);
+    ctx.fillText('Carnage v4.0 — T7.5 session settings persistence', 32, 48);
 
     ctx.textAlign = 'right';
     ctx.fillText(`frames:    ${frameCount}`, WORLD.width - 32, 48);
@@ -867,10 +1240,7 @@ function init(): void {
 
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      const winMsg =
-        matchOutcome === 'draw'
-          ? 'DRAW'
-          : `${matchOutcome} WINS`;
+      const winMsg = matchOutcome === 'draw' ? 'DRAW' : `${matchOutcome} WINS`;
       const winColor =
         matchOutcome === 'P1' ? plane1.color
         : matchOutcome === 'P2' ? plane2.color
@@ -879,25 +1249,15 @@ function init(): void {
       ctx.font = 'bold 120px system-ui, sans-serif';
       ctx.fillText(winMsg, WORLD.width / 2, WORLD.height * 0.32);
 
-      const btnW = 440;
-      const btnH = 104;
-      const btnX = WORLD.width / 2 - btnW / 2;
-      const btnY = WORLD.height * 0.52;
-      ctx.fillStyle = '#a89268';
-      ctx.fillRect(btnX, btnY, btnW, btnH);
-      ctx.strokeStyle = '#2a2014';
-      ctx.lineWidth = STROKE.emphasis;
-      ctx.strokeRect(btnX, btnY, btnW, btnH);
-      ctx.fillStyle = '#2a2014';
-      ctx.font = 'bold 56px system-ui, sans-serif';
-      ctx.fillText('PLAY AGAIN', WORLD.width / 2, btnY + btnH / 2);
+      drawButton(RESULT_PLAY_AGAIN_BUTTON, 'PLAY AGAIN', 56);
 
       ctx.fillStyle = '#e8e8e8';
       ctx.font = '28px system-ui, sans-serif';
+      ctx.textBaseline = 'alphabetic';
       ctx.fillText(
-        'click the button or press Enter / Space',
+        'click PLAY AGAIN or press Enter / Space',
         WORLD.width / 2,
-        btnY + btnH + 56,
+        RESULT_PLAY_AGAIN_BUTTON.y + RESULT_PLAY_AGAIN_BUTTON.h + 56,
       );
     }
 
