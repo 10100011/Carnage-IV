@@ -78,6 +78,13 @@ export const BULLETS = {
   maxPerPlane: 2,
   /** Safety cap on bullet lifetime. Normally bullets expire at the screen edge (§10). */
   maxLifetimeSec: 2.5,
+  /**
+   * Minimum seconds between auto-fires while the action button is held. Edge
+   * presses (discrete taps) bypass this and are gated only by `maxPerPlane`,
+   * so skilled players can still burst-fire both rounds instantly. Not in
+   * PROMPT.md §10 as of v4.3 — design tweak added after T4.2.
+   */
+  autoFireIntervalSec: 1.0,
 } as const;
 
 /** Collision geometry (§9.7). */

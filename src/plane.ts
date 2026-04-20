@@ -42,6 +42,13 @@ export interface Plane {
    * fires, with no intermediate "taxi-stopped" state to reset from.
    */
   autoStartTimerSec: number;
+  /**
+   * Sim-time (seconds) of this plane's last bullet fire. Drives the held-
+   * auto-fire rate limiter (`BULLETS.autoFireIntervalSec`). Initialised to
+   * `Number.NEGATIVE_INFINITY` on spawn and reset the same on respawn so the
+   * first press is never rate-gated.
+   */
+  lastFireAtSec: number;
   /** Placeholder identity colour. Polish phase replaces with a real palette (§16). */
   color: string;
 }
@@ -56,6 +63,13 @@ const SPRITE_SCALE = 1.5;
  * opposite screen edge (§8.5).
  */
 export const PLANE_SPRITE_EXTENT = HITBOX.planeRadius * SPRITE_SCALE * 1.4;
+
+/**
+ * Distance from the plane's centre to the tip of the placeholder sprite's
+ * nose, in logical units. Used by bullet spawn so rounds emerge from the
+ * visible nose rather than the circle centre (§10).
+ */
+export const PLANE_NOSE_OFFSET = HITBOX.planeRadius * SPRITE_SCALE * 1.3;
 
 /**
  * Draw a placeholder biplane sprite: an isoceles triangle aligned to heading.

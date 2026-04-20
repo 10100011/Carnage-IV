@@ -1,9 +1,88 @@
 import { drawArena } from './arena';
-import { HITBOX, MATCH, PHYSICS, TOWER, WORLD } from './config';
+import {
+  countBulletsOwnedBy,
+  drawBullet,
+  spawnBullet,
+  type Bullet,
+} from './bullet';
+import { BULLETS, HITBOX, MATCH, PHYSICS, TOWER, WORLD } from './config';
 import { startLoop } from './loop';
-import { drawPlane, PLANE_SPRITE_EXTENT, type Plane } from './plane';
+import {
+  drawPlane,
+  PLANE_NOSE_OFFSET,
+  PLANE_SPRITE_EXTENT,
+  type Plane,
+} from './plane';
 
 const TAU = Math.PI * 2;
+
+/**
+ * Minimum distance from a line-segment to a point, compared against a radius
+ * — returns true iff the segment (a → b) passes within `radius` of the
+ * circle centre (cx, cy). Used by the swept-segment bullet collision tests
+ * (§9.7) so a bullet moving faster than a hitbox's diameter per tick can't
+ * tunnel through. Strict `<` so tangent contact isn't a hit, matching the
+ * crash conventions elsewhere.
+ */
+function segmentHitsCircle(
+  ax: number, ay: number,
+  bx: number, by: number,
+  cx: number, cy: number,
+  radius: number,
+): boolean {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const lenSq = dx * dx + dy * dy;
+  let closestX: number;
+  let closestY: number;
+  if (lenSq === 0) {
+    closestX = ax;
+    closestY = ay;
+  } else {
+    const t = Math.max(0, Math.min(1, ((cx - ax) * dx + (cy - ay) * dy) / lenSq));
+    closestX = ax + t * dx;
+    closestY = ay + t * dy;
+  }
+  const ex = closestX - cx;
+  const ey = closestY - cy;
+  return ex * ex + ey * ey < radius * radius;
+}
+
+/**
+ * Does segment (a → b) intersect the axis-aligned rectangle? Liang-Barsky
+ * parameter clipping — tests all four slabs and returns true iff the t-range
+ * that satisfies every slab is non-empty. Used for the swept-segment bullet
+ * vs tower test (§9.6, T4.5). Boundary touches count as hits (a round that
+ * just grazes the tower should still be blocked).
+ */
+function segmentHitsAabb(
+  ax: number, ay: number,
+  bx: number, by: number,
+  left: number, top: number,
+  right: number, bottom: number,
+): boolean {
+  let t0 = 0;
+  let t1 = 1;
+  const dx = bx - ax;
+  const dy = by - ay;
+  const clip = (p: number, q: number): boolean => {
+    if (p === 0) return q >= 0;
+    const t = q / p;
+    if (p < 0) {
+      if (t > t1) return false;
+      if (t > t0) t0 = t;
+    } else {
+      if (t < t0) return false;
+      if (t < t1) t1 = t;
+    }
+    return true;
+  };
+  if (!clip(-dx, ax - left)) return false;
+  if (!clip(dx, right - ax)) return false;
+  if (!clip(-dy, ay - top)) return false;
+  if (!clip(dy, bottom - ay)) return false;
+  return true;
+}
 
 interface Viewport {
   /** Logical-units → backing-store-pixels scale factor. */
@@ -80,8 +159,14 @@ function init(): void {
     taxiCommitted: false,
     respawnTimerSec: 0,
     autoStartTimerSec: MATCH.autoStartIdleSec,
+    lastFireAtSec: Number.NEGATIVE_INFINITY,
     color: '#ffd27a',
   };
+
+  // All live bullets fired by any plane. Per-plane cap (§10, T4.2) and
+  // edge-expiry (T4.3) layer in next; for T4.1 the pool grows on fire and
+  // shrinks only via the safety-lifetime sweep below.
+  const bullets: Bullet[] = [];
 
   // Held-key map for input. Extracted to src/input.ts later (T5.2 P1/P2 mapping).
   const keys: Record<string, boolean> = {};
@@ -100,6 +185,28 @@ function init(): void {
   let frameCount = 0;
   let simSteps = 0;
   let simTimeSec = 0;
+
+  /**
+   * Apply the standard crash transition to a plane and arm the explosion /
+   * respawn clock (§12). Idempotent via the `crashed` guard, so if multiple
+   * crash sources trigger the same tick (tower + ground in the same step,
+   * bullet + tower, etc.) only the first actually fires. `reason` shows up
+   * in the debug log and is useful while tuning collision ordering.
+   *
+   * Site-specific position fix-ups (e.g. the ground-crash y-pin) stay inline
+   * at the caller; this helper owns only the state-machine transition.
+   */
+  function crashPlane(plane: Plane, reason: string): void {
+    if (plane.state === 'crashed') return;
+    plane.state = 'crashed';
+    plane.vx = 0;
+    plane.vy = 0;
+    plane.taxiCommitted = false;
+    plane.respawnTimerSec = MATCH.respawnDelaySec;
+    console.log(
+      `[crash] ${reason} at x=${plane.x.toFixed(0)}, y=${plane.y.toFixed(0)}, simTime=${simTimeSec.toFixed(2)}s`,
+    );
+  }
 
   function update(dt: number): void {
     simSteps++;
@@ -122,6 +229,7 @@ function init(): void {
         testPlane.taxiCommitted = false;
         testPlane.respawnTimerSec = 0;
         testPlane.autoStartTimerSec = MATCH.autoStartIdleSec;
+        testPlane.lastFireAtSec = Number.NEGATIVE_INFINITY;
         console.log(`[respawn] simTime=${simTimeSec.toFixed(2)}s`);
       }
     }
@@ -174,19 +282,53 @@ function init(): void {
     // (P1 action); the P2 key `k` wires in at T5.2.
     //   grounded + !taxiCommitted → commit taxi (T3.3 applies the thrust).
     //   grounded +  taxiCommitted → ignored; a committed taxi cannot be aborted.
-    //   airborne / stalled        → fire (stub — real bullet in T4.1).
+    //   airborne / stalled        → fire (edge press, plus held auto-fire
+    //                               every BULLETS.autoFireIntervalSec).
     //   crashed                   → ignored.
+    //
+    // Stalled planes can still fire — §2 calls out the stall-to-fire-rearward
+    // trick as a legitimate advanced tool. attemptFire() gates on the 2-
+    // bullet cap (§10), spawns from the visible nose with no velocity
+    // inheritance (§10), and records the fire time so the held auto-fire
+    // loop below can pace itself.
+    function attemptFire(): boolean {
+      if (countBulletsOwnedBy(bullets, testPlane) >= BULLETS.maxPerPlane) {
+        return false;
+      }
+      const noseX = testPlane.x + PLANE_NOSE_OFFSET * Math.sin(testPlane.heading);
+      const noseY = testPlane.y - PLANE_NOSE_OFFSET * Math.cos(testPlane.heading);
+      bullets.push(spawnBullet(noseX, noseY, testPlane.heading, testPlane));
+      testPlane.lastFireAtSec = simTimeSec;
+      return true;
+    }
+
+    const airborneFiringState =
+      testPlane.state === 'airborne' || testPlane.state === 'stalled';
+
     if (pressedKeys.has('s')) {
       if (testPlane.state === 'grounded') {
         if (!testPlane.taxiCommitted) {
           testPlane.taxiCommitted = true;
           console.log(`[action] taxi committed at simTime=${simTimeSec.toFixed(2)}s`);
         }
-      } else if (testPlane.state === 'airborne' || testPlane.state === 'stalled') {
-        console.log(`[fire] (stub) simTime=${simTimeSec.toFixed(2)}s`);
+      } else if (airborneFiringState) {
+        attemptFire();
       }
     }
     pressedKeys.clear();
+
+    // Held-auto-fire — action button held counts as 1 round per
+    // `BULLETS.autoFireIntervalSec`, still subject to the 2-bullet count cap.
+    // Edge presses above bypass the interval gate, so rapid tapping can drain
+    // both rounds instantly; only the "hold the button and forget" case paces
+    // itself at 1/s. Not in PROMPT.md §10 as of v4.3 — flagged at config.
+    if (
+      airborneFiringState &&
+      keys['s'] &&
+      simTimeSec - testPlane.lastFireAtSec >= BULLETS.autoFireIntervalSec
+    ) {
+      attemptFire();
+    }
 
     if (testPlane.state === 'grounded' && testPlane.taxiCommitted) {
       // Runway taxi — §8.2, §11. Full-power acceleration along heading; the
@@ -294,14 +436,7 @@ function init(): void {
       const dx = testPlane.x - cx;
       const dy = testPlane.y - cy;
       if (dx * dx + dy * dy < HITBOX.planeRadius * HITBOX.planeRadius) {
-        testPlane.state = 'crashed';
-        testPlane.vx = 0;
-        testPlane.vy = 0;
-        testPlane.taxiCommitted = false;
-        testPlane.respawnTimerSec = MATCH.respawnDelaySec;
-        console.log(
-          `[crash] tower contact at x=${testPlane.x.toFixed(0)}, y=${testPlane.y.toFixed(0)}, simTime=${simTimeSec.toFixed(2)}s`,
-        );
+        crashPlane(testPlane, 'tower contact');
       }
     }
 
@@ -317,15 +452,97 @@ function init(): void {
       (testPlane.state === 'airborne' || testPlane.state === 'stalled') &&
       testPlane.y + HITBOX.planeRadius > WORLD.groundY
     ) {
-      testPlane.state = 'crashed';
-      testPlane.vx = 0;
-      testPlane.vy = 0;
+      // Pin the wreck on the runway surface before the helper flips state —
+      // ground crashes are the one site that needs a position fix-up (tower /
+      // bullet leave the wreck wherever the impact happened).
       testPlane.y = WORLD.groundY - HITBOX.planeRadius;
-      testPlane.taxiCommitted = false;
-      testPlane.respawnTimerSec = MATCH.respawnDelaySec;
-      console.log(
-        `[crash] ground contact at x=${testPlane.x.toFixed(0)}, simTime=${simTimeSec.toFixed(2)}s`,
-      );
+      crashPlane(testPlane, 'ground contact');
+    }
+
+    // Bullet motion + swept-segment plane collision — §9.7, §10, T4.4.
+    // Iterate backwards so in-place splice doesn't skip the next element.
+    // Each tick:
+    //   1. Snapshot (prevX, prevY) for the swept segment.
+    //   2. Integrate straight-line motion at constant speed.
+    //   3. Test the (prev → curr) segment against every non-crashed plane's
+    //      hitbox circle. At BULLETS.speed * dt ≈ 16.7 u per step and a
+    //      40 u plane diameter, the segment can't skip a plane between
+    //      ticks, so no capsule-vs-capsule needed.
+    //   4. Self-kill allowed (§10) — owner is not excluded from the test.
+    //   5. On hit: crash the plane (one-shot), consume the bullet.
+    //   6. Safety lifetime reap until T4.3 lands the real edge-expiry rule.
+    const planesForCollision: Plane[] = [testPlane];
+    for (let i = bullets.length - 1; i >= 0; i--) {
+      const b = bullets[i]!;
+      b.prevX = b.x;
+      b.prevY = b.y;
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      b.ageSec += dt;
+
+      let consumed = false;
+
+      // Tower block — §9.6, §2, T4.5. Bullets stop on first contact with the
+      // tower AABB. Checked before the plane test so a target hiding behind
+      // the tower (low-altitude cover per §2) isn't shot through it.
+      if (
+        segmentHitsAabb(
+          b.prevX, b.prevY,
+          b.x, b.y,
+          TOWER.centreX - TOWER.width / 2,
+          TOWER.topY,
+          TOWER.centreX + TOWER.width / 2,
+          WORLD.groundY,
+        )
+      ) {
+        consumed = true;
+      }
+
+      if (!consumed) {
+        for (const target of planesForCollision) {
+          if (target.state === 'crashed') continue;
+          // Grounded-plane immunity — §10, T4.6. Position-based, NOT state-
+          // based: any plane whose hitbox still touches the runway surface
+          // (including the tangent-to-surface frame right after lift-off)
+          // is bulletproof. Immunity ends the instant the hitbox leaves the
+          // runway — §10 explicitly rules out a post-liftoff grace window.
+          if (target.y + HITBOX.planeRadius >= WORLD.groundY) continue;
+          if (
+            segmentHitsCircle(
+              b.prevX, b.prevY,
+              b.x, b.y,
+              target.x, target.y,
+              HITBOX.planeRadius,
+            )
+          ) {
+            crashPlane(target, b.owner === target ? 'self-kill bullet' : 'bullet');
+            consumed = true;
+            break;
+          }
+        }
+      }
+
+      // Edge expiry — §10, T4.3. Bullets never wrap; they disappear at any
+      // playfield boundary. Bottom edge is the runway surface (groundY), not
+      // the full world height, so rounds can't travel through the HUD strip.
+      // Checked after the plane collision so a single step that crosses both
+      // a hitbox and an edge still registers the kill. The lifetime safety
+      // cap below remains as a belt-and-braces backstop (§18 treats both as
+      // tunable), but with finite non-zero speed it should never fire.
+      if (!consumed) {
+        if (
+          b.x < 0 ||
+          b.x >= WORLD.width ||
+          b.y < 0 ||
+          b.y >= WORLD.groundY
+        ) {
+          consumed = true;
+        }
+      }
+
+      if (consumed || b.ageSec >= BULLETS.maxLifetimeSec) {
+        bullets.splice(i, 1);
+      }
     }
   }
 
@@ -349,10 +566,14 @@ function init(): void {
       drawPlane(ctx, testPlane, -WORLD.width);
     }
 
+    // Bullets render above planes so a round passing in front of a plane
+    // reads correctly. Bullets don't wrap (§10) so no ghost pass.
+    for (const b of bullets) drawBullet(ctx, b);
+
     ctx.fillStyle = '#fff';
     ctx.font = '28px system-ui, sans-serif';
     ctx.textAlign = 'left';
-    ctx.fillText('Carnage v4.0 — T3.6 auto-start', 32, 48);
+    ctx.fillText('Carnage v4.0 — T4.6 grounded immunity', 32, 48);
 
     ctx.textAlign = 'right';
     const headingDeg = (testPlane.heading * 180) / Math.PI;
@@ -366,6 +587,7 @@ function init(): void {
     ctx.fillText(`altitude:  ${altitude.toFixed(0)}`, WORLD.width - 32, 208);
     ctx.fillText(`state:     ${testPlane.state}`, WORLD.width - 32, 240);
     ctx.fillText(`taxi:      ${testPlane.taxiCommitted ? 'committed' : 'idle'}`, WORLD.width - 32, 272);
+    ctx.fillText(`bullets:   ${bullets.length}`, WORLD.width - 32, 336);
     if (testPlane.state === 'crashed') {
       ctx.fillText(`respawn:   ${testPlane.respawnTimerSec.toFixed(2)}s`, WORLD.width - 32, 304);
     } else if (testPlane.state === 'grounded' && !testPlane.taxiCommitted) {
