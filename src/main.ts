@@ -13,6 +13,13 @@ import {
   PLANE_SPRITE_EXTENT,
   type Plane,
 } from './plane';
+import {
+  AiPilotMedium,
+  AiPilotStub,
+  type Pilot,
+  type PilotInput,
+  type World,
+} from './pilot';
 
 const TAU = Math.PI * 2;
 
@@ -192,19 +199,6 @@ function init(): void {
   });
   const planes: Plane[] = [plane1, plane2];
 
-  // Per-plane human control bindings, index-aligned with `planes` (§14.1).
-  // `null` entries mean "no human" — T6 fills those with AI pilots, and
-  // stepPhysics still runs for the plane either way.
-  interface Controls {
-    ccw: string;
-    action: string;
-    cw: string;
-  }
-  const controls: Array<Controls | null> = [
-    { ccw: 'a', action: 's', cw: 'd' },
-    { ccw: 'j', action: 'k', cw: 'l' },
-  ];
-
   // All live bullets fired by any plane. Per-plane cap (§10, T4.2) and
   // edge-expiry (T4.3) layer in next; for T4.1 the pool grows on fire and
   // shrinks only via the safety-lifetime sweep below.
@@ -243,6 +237,55 @@ function init(): void {
   canvas.addEventListener('click', () => {
     if (matchOver) resetMatch();
   });
+
+  // Per-plane pilot assignment, index-aligned with `planes` (§15.1). Every
+  // plane that participates in the sim has a pilot — humans wrap the
+  // keyboard via `makeHumanPilot`, AI implementations live in src/pilot.ts.
+  // URL param `?p2=ai` swaps P2 to the T6.1 AI stub without editing code;
+  // default stays human so keyboard play is undisturbed. Phase 7's setup
+  // screen will replace this with UI-driven assignment.
+  interface KeyBindings {
+    ccw: string;
+    action: string;
+    cw: string;
+  }
+  function makeHumanPilot(bindings: KeyBindings): Pilot {
+    const label = `${bindings.ccw.toUpperCase()}/${bindings.action.toUpperCase()}/${bindings.cw.toUpperCase()}`;
+    return {
+      label,
+      update(): PilotInput {
+        const ccwDown = keys[bindings.ccw] === true;
+        const cwDown = keys[bindings.cw] === true;
+        return {
+          rotate: ccwDown && !cwDown ? -1 : !ccwDown && cwDown ? 1 : 0,
+          actionPress: pressedKeys.has(bindings.action),
+          actionHold: keys[bindings.action] === true,
+        };
+      },
+    };
+  }
+  // Pilot assignment via URL params (§15.1 dev flag).
+  //   P1 — default human (A/S/D). `?p1=ai` for AI medium, `?p1=ai-stub` idle.
+  //   P2 — default AI medium (Phase 6 focus). `?p2=human` for J/K/L keyboard,
+  //        `?p2=ai-stub` idle. Set both to `ai` for AI-only observation
+  //        (e.g. the T6.3 acceptance test: `?p1=ai&p2=ai` and watch).
+  // Phase 7's setup screen replaces all of this with UI-driven assignment.
+  const params = new URLSearchParams(window.location.search);
+  const p1Mode = (params.get('p1') ?? '').toLowerCase();
+  const p2Mode = (params.get('p2') ?? '').toLowerCase();
+  const p1Pilot: Pilot =
+    p1Mode === 'ai' ? new AiPilotMedium()
+    : p1Mode === 'ai-stub' ? new AiPilotStub()
+    : makeHumanPilot({ ccw: 'a', action: 's', cw: 'd' });
+  const p2Pilot: Pilot =
+    p2Mode === 'human' ? makeHumanPilot({ ccw: 'j', action: 'k', cw: 'l' })
+    : p2Mode === 'ai-stub' ? new AiPilotStub()
+    : new AiPilotMedium();
+  const pilots: Array<Pilot | null> = [p1Pilot, p2Pilot];
+  console.log(
+    `[init] P1 pilot: ${pilots[0]?.label ?? '—'} · P2 pilot: ${pilots[1]?.label ?? '—'}`,
+  );
+  const world: World = { planes, bullets };
 
   let frameCount = 0;
   let simSteps = 0;
@@ -372,35 +415,20 @@ function init(): void {
   }
 
   /**
-   * Rotation input — §8.1, §14.1. Active in airborne / stalled states.
-   * Grounded planes ignore rotation (§11 — they face the tower until the
-   * action button commits the taxi). While the hitbox is still tangent to
-   * the runway (airborne but not yet climbed), rotation is clamped to the
-   * upper semicircle so the pilot can't pitch the nose into the runway
-   * during takeoff — a quality-of-life guard, not a prompt-mandated rule.
-   */
-  function applyRotationInput(p: Plane, ctrl: Controls, dt: number): void {
-    if (p.state !== 'airborne' && p.state !== 'stalled') return;
-    let rot = 0;
-    if (keys[ctrl.ccw]) rot -= 1;
-    if (keys[ctrl.cw]) rot += 1;
-    if (rot === 0) return;
-    const newHeading =
-      ((p.heading + rot * PHYSICS.rotationRate * dt) % TAU + TAU) % TAU;
-    const onRunway = p.y + HITBOX.planeRadius >= WORLD.groundY;
-    if (onRunway && Math.cos(newHeading) < 0) {
-      // Snap to the nearer horizontal. Invariant: prevHeading is already in
-      // the upper semicircle, so < π → clamp right (π/2), else left (3π/2).
-      p.heading = p.heading < Math.PI ? Math.PI / 2 : 3 * Math.PI / 2;
-    } else {
-      p.heading = newHeading;
-    }
-  }
-
-  /**
-   * Action button — one input, two meanings (§8.2.1).
+   * Apply a pilot's per-tick input to its plane. Same code path for humans
+   * (keyboard-wrapped inputs) and AI (computed inputs), so every state
+   * transition — rotation clamps (§8.1, §11 on-runway guard), taxi commit
+   * (§8.2.1), fire cap + held auto-fire — is identical regardless of pilot.
+   *
+   * Rotation (§8.1, §14.1): active in airborne / stalled only. Grounded
+   * planes ignore rotation — they face the tower until the action button
+   * commits the taxi (§11). On-runway tangent frame is clamped to the
+   * upper semicircle so a pilot can't pitch into the runway during lift-
+   * off (quality-of-life guard, not prompt-mandated).
+   *
+   * Action button (§8.2.1):
    *   grounded + !taxiCommitted → commit taxi (stepPhysics applies thrust).
-   *   grounded +  taxiCommitted → ignored; a committed taxi cannot be aborted.
+   *   grounded +  taxiCommitted → ignored; a committed taxi can't be aborted.
    *   airborne / stalled        → edge press fires; hold auto-fires every
    *                               BULLETS.autoFireIntervalSec.
    *   crashed                   → ignored.
@@ -410,9 +438,23 @@ function init(): void {
    * gate so rapid tapping can drain both rounds instantly; `attemptFire`
    * updates `lastFireAtSec` so the held check here won't double-fire.
    */
-  function applyActionButton(p: Plane, ctrl: Controls): void {
+  function applyInput(p: Plane, input: PilotInput, dt: number): void {
+    if (
+      input.rotate !== 0 &&
+      (p.state === 'airborne' || p.state === 'stalled')
+    ) {
+      const newHeading =
+        ((p.heading + input.rotate * PHYSICS.rotationRate * dt) % TAU + TAU) % TAU;
+      const onRunway = p.y + HITBOX.planeRadius >= WORLD.groundY;
+      if (onRunway && Math.cos(newHeading) < 0) {
+        p.heading = p.heading < Math.PI ? Math.PI / 2 : 3 * Math.PI / 2;
+      } else {
+        p.heading = newHeading;
+      }
+    }
+
     const firing = p.state === 'airborne' || p.state === 'stalled';
-    if (pressedKeys.has(ctrl.action)) {
+    if (input.actionPress) {
       if (p.state === 'grounded') {
         if (!p.taxiCommitted) {
           p.taxiCommitted = true;
@@ -424,7 +466,7 @@ function init(): void {
     }
     if (
       firing &&
-      keys[ctrl.action] &&
+      input.actionHold &&
       simTimeSec - p.lastFireAtSec >= BULLETS.autoFireIntervalSec
     ) {
       attemptFire(p);
@@ -554,15 +596,16 @@ function init(): void {
       handleAutoStart(p, dt);
     }
 
-    // Human input, one plane per binding. Both planes read `pressedKeys`
-    // before it's cleared below, so same-tick presses by both players each
-    // get their edge seen exactly once.
+    // Pilot input, one plane per assigned pilot. Every pilot's update()
+    // reads `pressedKeys` before the shared clear below, so same-tick
+    // presses get their edge seen by each plane's human pilot exactly once;
+    // AI pilots don't observe keyboard state at all.
     for (let i = 0; i < planes.length; i++) {
       const p = planes[i]!;
-      const ctrl = controls[i];
-      if (!ctrl) continue; // AI pilots land in T6.
-      applyRotationInput(p, ctrl, dt);
-      applyActionButton(p, ctrl);
+      const pilot = pilots[i];
+      if (!pilot) continue;
+      const input = pilot.update(p, world, dt);
+      applyInput(p, input, dt);
     }
     pressedKeys.clear();
 
@@ -740,7 +783,7 @@ function init(): void {
     ctx.fillStyle = '#fff';
     ctx.font = '28px system-ui, sans-serif';
     ctx.textAlign = 'left';
-    ctx.fillText('Carnage v4.0 — T5.5 match end + play again', 32, 48);
+    ctx.fillText('Carnage v4.0 — T6.3 AI obstacle avoidance', 32, 48);
 
     ctx.textAlign = 'right';
     ctx.fillText(`frames:    ${frameCount}`, WORLD.width - 32, 48);
@@ -770,8 +813,8 @@ function init(): void {
         ctx.fillText(`auto-start:${p.autoStartTimerSec.toFixed(2)}s`, x, 416);
       }
     }
-    drawPlaneStats('P1 (A/S/D)', plane1, 32, 'left');
-    drawPlaneStats('P2 (J/K/L)', plane2, WORLD.width - 32, 'right');
+    drawPlaneStats(`P1 (${pilots[0]?.label ?? '—'})`, plane1, 32, 'left');
+    drawPlaneStats(`P2 (${pilots[1]?.label ?? '—'})`, plane2, WORLD.width - 32, 'right');
 
     // Per-player lives in the bottom HUD strip — §7, §12, §16.3. Label +
     // row of pips, coloured with the plane's signature colour. Pips spread
