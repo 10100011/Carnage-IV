@@ -1,5 +1,5 @@
 import type { Bullet } from './bullet';
-import { AI, HITBOX, PHYSICS, TOWER, WORLD } from './config';
+import { AI, BULLETS, HITBOX, PHYSICS, TOWER, WORLD, type AiDifficulty } from './config';
 import type { Plane } from './plane';
 
 const TAU = Math.PI * 2;
@@ -129,13 +129,14 @@ export interface World {
 /**
  * Per-tick input a pilot produces for its plane. Mirrors the keyboard /
  * touch-button semantics the sim already knows how to apply:
- *   - `rotate` is continuous (held-style).
+ *   - `rotate` is continuous (held-style) in [-1, 1]. ±1 = full rotation
+ *     rate, fractional values scale the rate (AI tiers use the factor
+ *     from `config.AI[tier].rotationFactor`). Human pilots emit ±1 or 0.
  *   - `actionPress` is a one-tick rising edge (taxi commit / edge fire).
  *   - `actionHold` is continuous (held auto-fire).
- * Human pilots derive these from real keystate; AI computes them.
  */
 export interface PilotInput {
-  rotate: -1 | 0 | 1;
+  rotate: number;
   actionPress: boolean;
   actionHold: boolean;
 }
@@ -173,46 +174,71 @@ export class AiPilotStub implements Pilot {
 }
 
 /**
- * Medium-tier AI pilot (§15.1, §15.2, T6.2). State machine over the plane's
- * own `state` + altitude + opponent presence:
+ * Tiered AI pilot (§15.1, §15.2). Shared state machine (takeoff → climb
+ * → pursue → fire, with obstacle avoidance) parameterized by per-tier
+ * constants from `config.AI[tier]`:
  *
- *   grounded (!taxiCommitted) → commit taxi (emit actionPress once).
- *   grounded ( taxiCommitted) → idle; physics is taxiing us.
- *   stalled                   → rotate to nose-down (§8.4 recovery); no fire.
- *   airborne & low altitude   → climb at the §8.3 sweet spot (30° off
- *                               horizontal) on the plane's spawn side.
- *   airborne & in band, with  → rotate to aim at target's current position
- *     a living opponent         (no lead — medium has predictiveAim:false)
- *                               and hold fire while aligned within
- *                               `AI.medium.aimToleranceRad`.
+ *   - `rotationFactor`    — scales rotate output so easy/medium AI turn
+ *                           slower than full 180°/s.
+ *   - `aimToleranceRad`   — firing cone width (narrow=harder, wide=easier).
+ *   - `reactionDelayMs`   — input buffered by this much before applying,
+ *                           simulating perceptual / decision lag.
+ *   - `predictiveAim`     — hard tier leads the target by `distance /
+ *                           BULLETS.speed` (first-order lead).
+ *   - `panicStallChance`  — per-second probability (easy tier) of briefly
+ *                           pitching straight up and stalling.
  *
- * Held auto-fire gives the 1/s cadence from T4.2's tweak automatically, so
- * the AI doesn't need its own fire cooldown. Tower / ground obstacle
- * avoidance is T6.3 — today the AI may still fly into the tower mid-
- * pursue.
+ * Pre-existing behaviour (tower avoidance, ground safety floor, taxi-
+ * delay randomization, climb-angle jitter, stall recovery) applies to
+ * every tier unchanged — tier differentiation is purely in the tunables.
  */
-export class AiPilotMedium implements Pilot {
-  readonly label = 'AI med';
+export class AiPilot implements Pilot {
+  readonly label: string;
+  private readonly params: typeof AI[AiDifficulty];
 
-  /**
-   * Per-spawn randomized state. Two concurrently spawned AI planes would
-   * otherwise commit taxi on the same tick, lift off at the same time,
-   * climb at the same angle, and converge at the same point above the
-   * tower — a reliable head-on kill every match. Randomizing the taxi
-   * delay desyncs lift-off times; jittering the climb angle keeps their
-   * ascent trajectories from being parallel even if the delay happens to
-   * land near zero.
-   *
-   * `-1` sentinel on `taxiDelayRemaining` means "not yet initialised for
-   * this spawn". The init block below sets both fields the first tick the
-   * plane is grounded + uncommitted; on taxi commit we reset the delay
-   * sentinel to -1 so the next respawn re-randomizes.
-   */
+  /** Per-spawn randomized taxi-commit delay sentinel. -1 = not initialised. */
   private taxiDelayRemaining = -1;
+  /** Per-spawn randomized climb heading (base 40° plus ±~3° jitter). */
   private climbHeadingOverride: number | null = null;
+  /** Pilot clock — accumulates dt so reaction buffer + panic timers are self-contained. */
+  private pilotTimeSec = 0;
+  /** Seconds-timestamp until which the easy-tier "panic stall" override is active. */
+  private panicUntilSec = 0;
+  /** Buffered past inputs for reaction-delay playback. Oldest at front. */
+  private readonly inputBuffer: { t: number; input: PilotInput }[] = [];
+
+  constructor(tier: AiDifficulty) {
+    this.params = AI[tier];
+    this.label = `AI ${tier}`;
+  }
 
   update(plane: Plane, world: World, dt: number): PilotInput {
-    if (plane.state === 'crashed') return IDLE_INPUT;
+    this.pilotTimeSec += dt;
+    const intended = this.computeInput(plane, world, dt);
+
+    // Reaction delay — §15.2. Return the input this pilot "decided"
+    // `reactionDelayMs` ago, not the instant one. The buffer fills up to
+    // `reactionDelay / dt` entries; shift aggressively so `buffer[0]` is
+    // the most-recent entry ≤ targetTime (startup returns current input
+    // until the buffer spans the delay window).
+    const delaySec = this.params.reactionDelayMs / 1000;
+    if (delaySec <= 0) return intended;
+    this.inputBuffer.push({ t: this.pilotTimeSec, input: intended });
+    const targetTime = this.pilotTimeSec - delaySec;
+    while (
+      this.inputBuffer.length >= 2 &&
+      (this.inputBuffer[1]?.t ?? Infinity) <= targetTime
+    ) {
+      this.inputBuffer.shift();
+    }
+    return this.inputBuffer[0]?.input ?? IDLE_INPUT;
+  }
+
+  /** Compute the instant, un-delayed input — the reaction delay wraps this. */
+  private computeInput(plane: Plane, world: World, dt: number): PilotInput {
+    if (plane.state === 'crashed' || plane.state === 'eliminated') {
+      return IDLE_INPUT;
+    }
 
     // Fresh-spawn randomization. Taxi delay spreads over 0–1.2 s, well
     // under the 5 s anti-camping auto-start (§11). Climb-angle jitter of
@@ -228,13 +254,13 @@ export class AiPilotMedium implements Pilot {
       this.climbHeadingOverride = spawnLeft
         ? Math.PI / 2 - (AI_CLIMB_ANGLE + climbAngleJitter)
         : (3 * Math.PI) / 2 + (AI_CLIMB_ANGLE + climbAngleJitter);
+      this.panicUntilSec = 0;
     }
 
     if (plane.state === 'grounded') {
       if (!plane.taxiCommitted) {
         this.taxiDelayRemaining -= dt;
         if (this.taxiDelayRemaining <= 0) {
-          // Consume + reset so the next respawn re-randomizes.
           this.taxiDelayRemaining = -1;
           return { rotate: 0, actionPress: true, actionHold: false };
         }
@@ -243,20 +269,36 @@ export class AiPilotMedium implements Pilot {
     }
 
     if (plane.state === 'stalled') {
-      // Stall recovery (§8.4): rotate to nose-down. Stop once within
-      // `stallRecoveryPitchTolerance` of π so gravity rebuilds airspeed;
-      // the sim flips state back to airborne on the next tick that meets
-      // both pitch and speed criteria.
+      // Stall recovery (§8.4): rotate to nose-down at the tier's rotation
+      // rate. Stop once within `stallRecoveryPitchTolerance` of π so
+      // gravity rebuilds airspeed; sim flips back to airborne on the
+      // next tick meeting both criteria.
       const diff = shortestAngularDelta(plane.heading, Math.PI);
-      const rotate: -1 | 0 | 1 =
-        Math.abs(diff) < PHYSICS.stallRecoveryPitchTolerance ? 0 : diff > 0 ? 1 : -1;
+      const rotate =
+        Math.abs(diff) < PHYSICS.stallRecoveryPitchTolerance
+          ? 0
+          : (diff > 0 ? 1 : -1) * this.params.rotationFactor;
       return { rotate, actionPress: false, actionHold: false };
     }
+
+    // Panic stall (easy tier, §15.2). Per-second chance to enter a panic
+    // state that forces the nose straight up until the plane stalls. The
+    // existing stall-recovery branch above handles pulling out — so the
+    // net effect is a lost fight and a dive.
+    if (this.params.panicStallChance > 0) {
+      if (
+        this.pilotTimeSec >= this.panicUntilSec &&
+        Math.random() < this.params.panicStallChance * dt
+      ) {
+        this.panicUntilSec = this.pilotTimeSec + 2.0;
+        console.log(`[ai ${this.label}] panic stall triggered`);
+      }
+    }
+    const inPanic = this.pilotTimeSec < this.panicUntilSec;
 
     // Airborne.
     const altitude = WORLD.groundY - plane.y;
     const target = findNearestOpponent(plane, world);
-
     const spawnLeft = plane.spawn.x < WORLD.width / 2;
     const climbHeading =
       this.climbHeadingOverride ??
@@ -265,64 +307,79 @@ export class AiPilotMedium implements Pilot {
     let desiredHeading: number;
     let pursuing = false;
     let losBlocked = false;
-    if (altitude < AI_COMBAT_ALTITUDE || target === null) {
-      // Climb or idle-hold-altitude. Spawn side picks which angle — keeps
-      // the plane heading inward toward the contested airspace rather than
-      // wrapping out the far edge.
+
+    if (inPanic) {
+      desiredHeading = 0; // straight up — forces climb penalty to stall us
+    } else if (altitude < AI_COMBAT_ALTITUDE || target === null) {
       desiredHeading = climbHeading;
     } else {
-      // Pursue: aim at target's current position — unless the tower blocks
-      // LOS, in which case route over the top. Heading convention (§8.1):
-      // nose direction (sin h, -cos h) = (dx, dy) / |d| ⇒ h = atan2(dx, -dy).
+      // Pursue. Tower blocks LOS → route over the top via waypoint.
+      // Otherwise aim at target position, optionally lead the target by
+      // bullet travel time when the tier has predictiveAim enabled.
       const towerLeft = TOWER.centreX - TOWER.width / 2;
       const towerRight = TOWER.centreX + TOWER.width / 2;
       losBlocked = segmentCrossesAabb(
         plane.x, plane.y, target.x, target.y,
         towerLeft, TOWER.topY, towerRight, WORLD.groundY,
       );
-      const aimX = losBlocked ? TOWER.centreX : target.x;
-      const aimY = losBlocked ? TOWER.topY - AI_TOWER_CLEARANCE : target.y;
+      let aimX: number;
+      let aimY: number;
+      if (losBlocked) {
+        aimX = TOWER.centreX;
+        aimY = TOWER.topY - AI_TOWER_CLEARANCE;
+      } else if (this.params.predictiveAim) {
+        // First-order lead: assume target continues at its current
+        // velocity for the bullet's flight time. Bullets have no
+        // velocity inheritance (§10), so travel time is purely
+        // distance / BULLETS.speed.
+        const dx0 = target.x - plane.x;
+        const dy0 = target.y - plane.y;
+        const dist = Math.hypot(dx0, dy0);
+        const bulletTime = dist / BULLETS.speed;
+        aimX = target.x + target.vx * bulletTime;
+        aimY = target.y + target.vy * bulletTime;
+      } else {
+        aimX = target.x;
+        aimY = target.y;
+      }
       const dx = aimX - plane.x;
       const dy = aimY - plane.y;
       desiredHeading = ((Math.atan2(dx, -dy) % TAU) + TAU) % TAU;
-      // Rotate toward the target regardless, but don't fire while the
-      // target's hitbox still touches the runway — §10 grounded immunity
-      // means the round would just pass through. Keeps tracking live so
-      // the trigger resumes the instant the target lifts off.
-      const targetOnRunway =
-        target.y + HITBOX.planeRadius >= WORLD.groundY;
+      // §10: don't fire at a runway-camped target — bullets pass through.
+      const targetOnRunway = target.y + HITBOX.planeRadius >= WORLD.groundY;
       pursuing = !targetOnRunway;
     }
 
-    // Ground-avoidance backstop (§15.1, T6.3). If we're below the safety
-    // floor AND the desired heading dives, pitch up to the climb heading
-    // instead. Suppresses firing because the override isn't aimed at
-    // anything we'd want to shoot. With the floor set above tower-top
-    // altitude, this also makes accidental tower-body crashes impossible
-    // during pursuit — a second line of defence behind the tower routing.
-    if (altitude < AI_GROUND_SAFETY_ALTITUDE && -Math.cos(desiredHeading) > 0) {
+    // Ground-avoidance backstop (§15.1, T6.3). Only overrides when not
+    // actively panicking — during panic we *want* the nose up so the
+    // stall triggers.
+    if (
+      !inPanic &&
+      altitude < AI_GROUND_SAFETY_ALTITUDE &&
+      -Math.cos(desiredHeading) > 0
+    ) {
       desiredHeading = climbHeading;
       pursuing = false;
     }
 
     const diff = shortestAngularDelta(plane.heading, desiredHeading);
-    // Rotation uses the tight deadzone so climb / aim headings are held
-    // precisely; firing uses the wider `aimToleranceRad` cone so medium
-    // AI doesn't have to pin the opponent in a 2° window before pulling
-    // the trigger. LOS-blocked pursuit still rotates toward the waypoint
-    // but can't fire — the "aligned" heading would put the round into the
-    // tower, not the target.
-    const rotate: -1 | 0 | 1 =
-      Math.abs(diff) < AI_ROTATION_DEADZONE ? 0 : diff > 0 ? 1 : -1;
+    // Rotation scaled by tier's rotationFactor; firing cone uses tier's
+    // aimToleranceRad. Easy is lazy on both, hard is sharp on both.
+    const rotate =
+      Math.abs(diff) < AI_ROTATION_DEADZONE
+        ? 0
+        : (diff > 0 ? 1 : -1) * this.params.rotationFactor;
     const firingAligned =
-      pursuing && !losBlocked && Math.abs(diff) < AI.medium.aimToleranceRad;
+      !inPanic &&
+      pursuing &&
+      !losBlocked &&
+      Math.abs(diff) < this.params.aimToleranceRad;
 
     return {
       rotate,
       actionPress: false,
-      // Held action while aligned on a live target: 2-bullet cap + 1/s
-      // held-auto-fire interval naturally pace the shots.
       actionHold: firingAligned,
     };
   }
 }
+

@@ -14,7 +14,7 @@ import {
   type Plane,
 } from './plane';
 import {
-  AiPilotMedium,
+  AiPilot,
   AiPilotStub,
   type Pilot,
   type PilotInput,
@@ -431,9 +431,11 @@ function init(): void {
     const t = setupHumans + v;
     return t < MIN_TOTAL_PLANES || t > MAX_TOTAL_PLANES_CURRENT;
   }
-  function difficultyDisabled(d: Difficulty): boolean {
-    // Only medium wired today (§5 interim-build). T9 unlocks easy/hard.
-    return d !== 'medium';
+  function difficultyDisabled(_d: Difficulty): boolean {
+    // All three tiers wired as of T9. Kept as a helper so Phase 7's
+    // setup UI can still grey tiers out in interim builds if future
+    // changes need to re-gate any of them.
+    return false;
   }
 
   /** Collision-mode descriptor for a given plane count — §9.3 / §13.2. */
@@ -479,10 +481,8 @@ function init(): void {
     return { x: 410 + idx * 130, y: 600, w: 120, h: 50 };
   }
 
-  function makeAiPilotForDifficulty(_d: Difficulty): Pilot {
-    // Single wired tier today — T9 adds easy / hard classes. Parameter
-    // retained so the switch is a one-line swap when those tiers land.
-    return new AiPilotMedium();
+  function makeAiPilotForDifficulty(d: Difficulty): Pilot {
+    return new AiPilot(d);
   }
 
   /**
@@ -508,13 +508,13 @@ function init(): void {
   function assignPilotsFromUrl(): void {
     pilots.length = 0;
     const p1Pilot: Pilot =
-      p1UrlMode === 'ai' ? new AiPilotMedium()
+      p1UrlMode === 'ai' ? new AiPilot('medium')
       : p1UrlMode === 'ai-stub' ? new AiPilotStub()
       : makeHumanPilot({ ccw: 'a', action: 's', cw: 'd' });
     const p2Pilot: Pilot =
       p2UrlMode === 'human' ? makeHumanPilot({ ccw: 'j', action: 'k', cw: 'l' })
       : p2UrlMode === 'ai-stub' ? new AiPilotStub()
-      : new AiPilotMedium();
+      : new AiPilot('medium');
     pilots.push(p1Pilot, p2Pilot);
   }
 
@@ -1357,7 +1357,7 @@ function init(): void {
     ctx.fillStyle = '#fff';
     ctx.font = '28px system-ui, sans-serif';
     ctx.textAlign = 'left';
-    ctx.fillText(`Carnage v4.0 — Phase 8 · ${planes.length}-plane · ${matchMode === 'dogfight' ? 'Dogfight' : 'Close Quarters'}`, 32, 48);
+    ctx.fillText(`Carnage v4.0 — Phase 9 · ${planes.length}-plane · ${matchMode === 'dogfight' ? 'Dogfight' : 'Close Quarters'}`, 32, 48);
 
     ctx.textAlign = 'right';
     ctx.fillText(`frames:    ${frameCount}`, WORLD.width - 32, 48);
