@@ -103,6 +103,8 @@ export const MATCH = {
   autoStartIdleSec: 5.0,
   /** Warning-pulse timings relative to auto-start — T−2 s and T−1 s (§11). */
   autoStartWarningsSec: [2.0, 1.0] as const,
+  /** Seconds the "RAMMING ON" / "BULLETS ONLY" banner is shown on match-start (§9.4, T8.4). */
+  modeBannerSec: 2.0,
 } as const;
 
 /**
@@ -155,6 +157,25 @@ export const AI = {
 } as const;
 
 export type AiDifficulty = keyof typeof AI;
+
+/**
+ * Per-plane signature colours (§16.3) for up to 8 planes. Order is the
+ * global plane index (P1, P2, …). Tuned for readability against the sky
+ * fill `#7bb5e3`, the runway `#a89268`, and the HUD strip `#14192a` —
+ * bright saturated hues across the hue circle so no two planes ever read
+ * as the same colour at a glance. Replaced by the polish-phase palette
+ * (T11.5) once art direction locks.
+ */
+export const PLAYER_COLORS: readonly string[] = [
+  '#ffd27a', // P1 yellow
+  '#7ac6ff', // P2 blue
+  '#ff8a8a', // P3 red
+  '#8affa5', // P4 green
+  '#d890ff', // P5 purple
+  '#ffb06b', // P6 orange
+  '#7affe9', // P7 cyan
+  '#ff8fc9', // P8 pink
+] as const;
 
 /**
  * Purely cosmetic values — changing these affects look only, not gameplay.

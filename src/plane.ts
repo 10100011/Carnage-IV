@@ -1,7 +1,20 @@
 import { HITBOX, STROKE } from './config';
 
-/** Plane life-cycle states. §8.2 / §8.4 / §11 / §12. */
-export type PlaneState = 'grounded' | 'airborne' | 'stalled' | 'crashed';
+/**
+ * Plane life-cycle states. §8.2 / §8.4 / §11 / §12.
+ *   grounded   — sitting on runway, pre-taxi-commit or taxiing.
+ *   airborne   — free flight, under pitch-coupling physics.
+ *   stalled    — airspeed/ceiling stall, gravity dominates.
+ *   crashed    — post-impact wreck, respawn timer ticking (may respawn or
+ *                transition to `eliminated` on timeout when lives are 0).
+ *   eliminated — permanently out of the match. Not rendered, not collided.
+ */
+export type PlaneState =
+  | 'grounded'
+  | 'airborne'
+  | 'stalled'
+  | 'crashed'
+  | 'eliminated';
 
 /**
  * Plane entity.

@@ -5,7 +5,7 @@ import {
   spawnBullet,
   type Bullet,
 } from './bullet';
-import { BULLETS, HITBOX, MATCH, PHYSICS, PLAYERS, STROKE, TOWER, WORLD } from './config';
+import { BULLETS, HITBOX, MATCH, PHYSICS, PLAYER_COLORS, PLAYERS, STROKE, TOWER, WORLD } from './config';
 import { startLoop } from './loop';
 import {
   drawPlane,
@@ -148,14 +148,13 @@ function init(): void {
   resize();
   window.addEventListener('resize', resize);
 
-  // Spawn slot math per §9.2: each runway side's usable length runs from the
-  // tower's inner edge out to the playfield edge, and plane i of n on that
-  // side sits at i/(n+1) of that length measured from the tower (plane 1 is
-  // innermost). With two planes total (one per side), each is the midpoint
-  // of its half. y places the hitbox bottom exactly on the runway surface.
-  // N-plane generalization is T8.1's job; today we hand-roll n=1 per side.
-  const leftInnerEdge = TOWER.centreX - TOWER.width / 2;
-  const rightInnerEdge = TOWER.centreX + TOWER.width / 2;
+  // Spawn slot math per §9.2 (revised from i/(n+1) after playtest): planes
+  // alternate sides as their global index increases — plane 1 left, plane
+  // 2 right, plane 3 left, plane 4 right, ... Right-side planes face left
+  // (heading 3π/2) with their sprite mirrored. Per-side slots are packed
+  // near the outer runway edge with a fixed gap (see SPAWN_EDGE_PADDING /
+  // SPAWN_SLOT_GAP) so no plane has noticeably less pre-tower runway than
+  // another. Respawn picks the outermost free slot dynamically.
   const groundedY = WORLD.groundY - HITBOX.planeRadius;
 
   function makeGroundedPlane(opts: {
@@ -182,22 +181,93 @@ function init(): void {
     };
   }
 
-  // P1 on the left runway, facing the tower (heading π/2).
-  const plane1 = makeGroundedPlane({
-    x: leftInnerEdge * 0.5,
-    heading: Math.PI / 2,
-    color: '#ffd27a',
-    mirror: false,
-  });
-  // P2 on the right runway, facing the tower (heading 3π/2), sprite mirrored
-  // per §9.2. T5.2 wires its input; until then it sits idle.
-  const plane2 = makeGroundedPlane({
-    x: (rightInnerEdge + WORLD.width) * 0.5,
-    heading: 3 * Math.PI / 2,
-    color: '#7ac6ff',
-    mirror: true,
-  });
-  const planes: Plane[] = [plane1, plane2];
+  /** Live plane roster. Rebuilt by `buildPlanes` at every match start. */
+  const planes: Plane[] = [];
+
+  /**
+   * Spawn-slot packing toward the runway's outer edge. Outer slot 0 sits
+   * `SPAWN_EDGE_PADDING` units from the playfield edge; subsequent slots
+   * step inward by `SPAWN_SLOT_GAP`. Keeps the initial spread compact and
+   * close to the outer edges so more central slots don't have noticeably
+   * less usable runway before the tower — playtest feedback from the
+   * previous §9.2 i/(n+1) layout showed the innermost planes felt
+   * disadvantaged.
+   */
+  const SPAWN_EDGE_PADDING = 80;
+  const SPAWN_SLOT_GAP = 100;
+
+  /**
+   * Per-side slot x-positions, outer-to-inner. Rebuilt every match by
+   * `buildPlanes`. Respawn picks the outermost free slot so a lone
+   * respawner always lands at the outer tip, while simultaneous respawns
+   * naturally offset into adjacent slots.
+   */
+  let sideSlotsLeft: number[] = [];
+  let sideSlotsRight: number[] = [];
+
+  /**
+   * Populate `planes` with `count` planes (§9.1, §9.2). Alternates left /
+   * right as the global index climbs (plane 1 → left, plane 2 → right,
+   * etc.), assigning each plane to the outermost unused slot on its side.
+   * Mutates the shared `planes` array in place so existing references
+   * (render loop, collisions, bullet owner pointers) remain valid across
+   * matches.
+   */
+  function buildPlanes(count: number): void {
+    planes.length = 0;
+    const leftCount = Math.ceil(count / 2);
+    const rightCount = Math.floor(count / 2);
+
+    sideSlotsLeft = [];
+    for (let i = 0; i < leftCount; i++) {
+      sideSlotsLeft.push(SPAWN_EDGE_PADDING + i * SPAWN_SLOT_GAP);
+    }
+    sideSlotsRight = [];
+    for (let i = 0; i < rightCount; i++) {
+      sideSlotsRight.push(WORLD.width - SPAWN_EDGE_PADDING - i * SPAWN_SLOT_GAP);
+    }
+
+    let leftAssigned = 0;
+    let rightAssigned = 0;
+    for (let globalIdx = 0; globalIdx < count; globalIdx++) {
+      const isLeft = globalIdx % 2 === 0;
+      const color = PLAYER_COLORS[globalIdx] ?? '#ffffff';
+      if (isLeft) {
+        const x = sideSlotsLeft[leftAssigned]!;
+        leftAssigned++;
+        planes.push(makeGroundedPlane({ x, heading: Math.PI / 2, color, mirror: false }));
+      } else {
+        const x = sideSlotsRight[rightAssigned]!;
+        rightAssigned++;
+        planes.push(makeGroundedPlane({ x, heading: (3 * Math.PI) / 2, color, mirror: true }));
+      }
+    }
+  }
+
+  /**
+   * Pick the outermost slot on `plane`'s runway side that isn't occupied
+   * by another non-taxiing plane. "Occupied" means another plane is sat
+   * at that x in the `grounded` state — a plane that's already taxiing
+   * has moved off its spawn slot, so its original slot is available.
+   * Returns the slot x. Falls back to the innermost slot if all are
+   * taken (shouldn't happen with one slot per plane).
+   */
+  function pickRespawnSlotX(plane: Plane): number {
+    const slots = plane.spawn.x < WORLD.width / 2 ? sideSlotsLeft : sideSlotsRight;
+    for (const x of slots) {
+      let taken = false;
+      for (const other of planes) {
+        if (other === plane) continue;
+        if (other.state !== 'grounded') continue;
+        if (Math.abs(other.x - x) < 2) {
+          taken = true;
+          break;
+        }
+      }
+      if (!taken) return x;
+    }
+    return slots[slots.length - 1] ?? plane.spawn.x;
+  }
 
   // All live bullets fired by any plane. Per-plane cap (§10, T4.2) and
   // edge-expiry (T4.3) layer in next; for T4.1 the pool grows on fire and
@@ -309,31 +379,17 @@ function init(): void {
       },
     };
   }
-  // Pilot assignment via URL params (§15.1 dev flag).
-  //   P1 — default human (A/S/D). `?p1=ai` for AI medium, `?p1=ai-stub` idle.
-  //   P2 — default AI medium (Phase 6 focus). `?p2=human` for J/K/L keyboard,
-  //        `?p2=ai-stub` idle. Set both to `ai` for AI-only observation
-  //        (e.g. the T6.3 acceptance test: `?p1=ai&p2=ai` and watch).
-  // Phase 7's setup screen replaces all of this with UI-driven assignment.
+  // Live pilot roster, index-aligned with `planes`. Populated by
+  // `assignPilots` / `assignPilotsFromUrl` as matches begin.
+  const pilots: Array<Pilot | null> = [];
+
   const params = new URLSearchParams(window.location.search);
-  const p1Mode = (params.get('p1') ?? '').toLowerCase();
-  const p2Mode = (params.get('p2') ?? '').toLowerCase();
-  const p1Pilot: Pilot =
-    p1Mode === 'ai' ? new AiPilotMedium()
-    : p1Mode === 'ai-stub' ? new AiPilotStub()
-    : makeHumanPilot({ ccw: 'a', action: 's', cw: 'd' });
-  const p2Pilot: Pilot =
-    p2Mode === 'human' ? makeHumanPilot({ ccw: 'j', action: 'k', cw: 'l' })
-    : p2Mode === 'ai-stub' ? new AiPilotStub()
-    : new AiPilotMedium();
-  const pilots: Array<Pilot | null> = [p1Pilot, p2Pilot];
-  // Dev back-door: if any URL pilot flag is set, bypass the setup screen
-  // and go straight to the match. Primarily for AI-vs-AI observation runs
-  // (T6.3 acceptance). The setup UI becomes the source of truth otherwise.
+  const p1UrlMode = (params.get('p1') ?? '').toLowerCase();
+  const p2UrlMode = (params.get('p2') ?? '').toLowerCase();
+  // Dev back-door: if any URL pilot flag is set, bypass setup and start
+  // immediately as a 2-plane match with URL-driven pilots. Primarily for
+  // AI-vs-AI observation (T6.3 acceptance).
   const skipSetupViaUrl = params.has('p1') || params.has('p2');
-  console.log(
-    `[init] P1 pilot: ${pilots[0]?.label ?? '—'} · P2 pilot: ${pilots[1]?.label ?? '—'}${skipSetupViaUrl ? ' (URL override — skipping setup)' : ''}`,
-  );
   const world: World = { planes, bullets };
 
   let frameCount = 0;
@@ -361,8 +417,8 @@ function init(): void {
   let setupAi = 1;
   let setupDifficulty: Difficulty = 'medium';
 
-  const MAX_TOTAL_PLANES_CURRENT = 2; // raised to 8 at T8
-  const MIN_TOTAL_PLANES = 2;
+  const MAX_TOTAL_PLANES_CURRENT = PLAYERS.maxPerMatch; // §9.1, raised from 2 at T8.1
+  const MIN_TOTAL_PLANES = PLAYERS.minPerMatch;
 
   function setupTotalPlanes(): number {
     return setupHumans + setupAi;
@@ -423,11 +479,55 @@ function init(): void {
     return { x: 410 + idx * 130, y: 600, w: 120, h: 50 };
   }
 
+  function makeAiPilotForDifficulty(_d: Difficulty): Pilot {
+    // Single wired tier today — T9 adds easy / hard classes. Parameter
+    // retained so the switch is a one-line swap when those tiers land.
+    return new AiPilotMedium();
+  }
+
+  /**
+   * Populate `pilots` to match `planes.length`. Slot 0 is always P1
+   * keyboard (A/S/D). Slot 1 becomes P2 keyboard (J/K/L) when
+   * `setupHumans === 2`, otherwise AI. Slots 2+ are always AI per the
+   * current `setupDifficulty` tier (§14.1 / §15).
+   */
+  function assignPilots(): void {
+    pilots.length = 0;
+    for (let i = 0; i < planes.length; i++) {
+      if (i === 0) {
+        pilots.push(makeHumanPilot({ ccw: 'a', action: 's', cw: 'd' }));
+      } else if (i === 1 && setupHumans === 2) {
+        pilots.push(makeHumanPilot({ ccw: 'j', action: 'k', cw: 'l' }));
+      } else {
+        pilots.push(makeAiPilotForDifficulty(setupDifficulty));
+      }
+    }
+  }
+
+  /** URL-override pilot set used by the dev back-door (two-plane match). */
+  function assignPilotsFromUrl(): void {
+    pilots.length = 0;
+    const p1Pilot: Pilot =
+      p1UrlMode === 'ai' ? new AiPilotMedium()
+      : p1UrlMode === 'ai-stub' ? new AiPilotStub()
+      : makeHumanPilot({ ccw: 'a', action: 's', cw: 'd' });
+    const p2Pilot: Pilot =
+      p2UrlMode === 'human' ? makeHumanPilot({ ccw: 'j', action: 'k', cw: 'l' })
+      : p2UrlMode === 'ai-stub' ? new AiPilotStub()
+      : new AiPilotMedium();
+    pilots.push(p1Pilot, p2Pilot);
+  }
+
   // Match lifecycle — §12. `matchOver` freezes the sim and shows the result
-  // screen; `matchOutcome` records who won (or draw for simultaneous last-
-  // life eliminations). Cleared by `resetMatch` when the player hits Start.
+  // screen. `matchOutcome` is either a winning plane index or a draw token
+  // (simultaneous last-life eliminations). Cleared by `resetMatch` when the
+  // player hits Start. Collision mode (§9.3) is determined at match start
+  // from the plane count and fixed for the match's duration.
   let matchOver = false;
-  let matchOutcome: 'P1' | 'P2' | 'draw' | null = null;
+  type MatchOutcome = { kind: 'draw' } | { kind: 'winner'; index: number };
+  let matchOutcome: MatchOutcome | null = null;
+  let matchMode: 'closeQuarters' | 'dogfight' = 'closeQuarters';
+  let matchStartBannerRemainingSec = 0;
 
   /**
    * Shared button-rect record so render, hit-test, and keyboard shortcuts
@@ -462,6 +562,24 @@ function init(): void {
     );
   }
 
+  // Bootstrap planes + pilots — either URL-driven 2-plane match or the
+  // default 2-plane state the setup screen starts from. The setup UI's
+  // Start handler rebuilds both arrays to match its selections.
+  if (skipSetupViaUrl) {
+    buildPlanes(2);
+    assignPilotsFromUrl();
+    // Arm the §9.4 match-start banner on the dev back-door path too so
+    // behaviour is consistent with Start-from-setup.
+    matchStartBannerRemainingSec = MATCH.modeBannerSec;
+  } else {
+    buildPlanes(setupTotalPlanes());
+    assignPilots();
+  }
+  matchMode = planes.length >= PLAYERS.dogfightModeMinPlanes ? 'dogfight' : 'closeQuarters';
+  console.log(
+    `[init] planes=${planes.length} · mode=${matchMode} · P1=${pilots[0]?.label ?? '—'} · P2=${pilots[1]?.label ?? '—'}${skipSetupViaUrl ? ' (URL override — skipping setup)' : ''}`,
+  );
+
   /**
    * Reset every plane to its spawn pose with full lives, clear all bullets
    * and per-plane timers, and flip `matchOver` off. Called when the player
@@ -493,15 +611,14 @@ function init(): void {
   }
 
   function startMatch(): void {
-    // Apply the current setup selections to the pilots array. P1 is always
-    // keyboard-human when humans ≥ 1; P2 becomes the second keyboard human
-    // if `setupHumans === 2`, otherwise the AI medium pilot. `difficulty`
-    // will differentiate AI tiers once T9 adds easy/hard pilot classes —
-    // for now medium is the only wired tier and selection is a no-op.
-    pilots[0] = makeHumanPilot({ ccw: 'a', action: 's', cw: 'd' });
-    pilots[1] = setupHumans === 2
-      ? makeHumanPilot({ ccw: 'j', action: 'k', cw: 'l' })
-      : new AiPilotMedium();
+    // Rebuild the plane roster and pilots from the current setup choices
+    // (§13). Collision mode (§9.3) is fixed here for the match's duration
+    // based on total plane count. The match-start mode banner (§9.4) fires
+    // on every entry so the active rule is unambiguous.
+    buildPlanes(setupTotalPlanes());
+    assignPilots();
+    matchMode = setupTotalPlanes() >= PLAYERS.dogfightModeMinPlanes ? 'dogfight' : 'closeQuarters';
+    matchStartBannerRemainingSec = MATCH.modeBannerSec;
     resetMatch();
     gameState = 'match';
   }
@@ -523,7 +640,7 @@ function init(): void {
    * at the caller; this helper owns only the state-machine transition.
    */
   function crashPlane(plane: Plane, reason: string): void {
-    if (plane.state === 'crashed') return;
+    if (plane.state === 'crashed' || plane.state === 'eliminated') return;
     plane.state = 'crashed';
     plane.vx = 0;
     plane.vy = 0;
@@ -547,13 +664,17 @@ function init(): void {
     p.respawnTimerSec -= dt;
     if (p.respawnTimerSec > 0) return;
     if (p.lives <= 0) {
-      // Permanently out (§12). Clamp the timer so it doesn't drift negative
-      // and stays read-correct in the debug HUD; wreck stays where it fell.
-      // Match-end / result-screen logic is T5.5.
+      // Permanently out (§12). Transition to `eliminated` so render and
+      // collision loops drop the plane — no lingering wreck.
+      p.state = 'eliminated';
       p.respawnTimerSec = 0;
       return;
     }
-    p.x = p.spawn.x;
+    // Dynamic respawn slot: outermost free slot on this plane's side.
+    // Simultaneous respawns naturally offset because the first to respawn
+    // this tick goes to slot 0 and its state flips to `grounded`, which
+    // the next respawner then sees as taken.
+    p.x = pickRespawnSlotX(p);
     p.y = p.spawn.y;
     p.vx = 0;
     p.vy = 0;
@@ -563,7 +684,7 @@ function init(): void {
     p.respawnTimerSec = 0;
     p.autoStartTimerSec = MATCH.autoStartIdleSec;
     p.lastFireAtSec = Number.NEGATIVE_INFINITY;
-    console.log(`[respawn] simTime=${simTimeSec.toFixed(2)}s`);
+    console.log(`[respawn] x=${p.x.toFixed(0)} simTime=${simTimeSec.toFixed(2)}s`);
   }
 
   /**
@@ -741,7 +862,7 @@ function init(): void {
     // any non-crashed state. Closest-point-on-AABB squared-distance test.
     // Strict `<` so tangent contact isn't a crash — same convention as the
     // ground check below.
-    if (p.state !== 'crashed') {
+    if (p.state !== 'crashed' && p.state !== 'eliminated') {
       const towerLeft = TOWER.centreX - TOWER.width / 2;
       const towerRight = TOWER.centreX + TOWER.width / 2;
       const cx = Math.max(towerLeft, Math.min(p.x, towerRight));
@@ -775,6 +896,12 @@ function init(): void {
     simSteps++;
     simTimeSec += dt;
 
+    // Match-start banner countdown (§9.4, T8.4). Independent of the match
+    // physics loop — ticks even while crashed planes are respawning.
+    if (matchStartBannerRemainingSec > 0) {
+      matchStartBannerRemainingSec = Math.max(0, matchStartBannerRemainingSec - dt);
+    }
+
     // Time-based triggers (both planes) before inputs fire, so a respawning
     // plane's state is already 'grounded' by the time input runs this tick.
     for (const p of planes) {
@@ -798,31 +925,33 @@ function init(): void {
     // Per-plane physics + environment collisions.
     for (const p of planes) stepPhysics(p, dt);
 
-    // Plane-plane mid-air collision — §9.3 Close Quarters, §9.5 ground
-    // exemption. With 2 planes we're in Close Quarters: any pair whose
-    // hitboxes overlap *in the air* crashes both. §9.5: planes on the
-    // runway (hitbox in contact with surface) don't collide — taxi stacking
-    // is allowed. The moment either plane lifts off, air rules apply.
+    // Plane-plane mid-air collision — §9.3, §9.5. Close Quarters mode
+    // (≤ 4 planes) crashes both participants on any in-air hitbox overlap;
+    // Dogfight mode (≥ 5 planes, T8.3) suppresses the crash entirely —
+    // planes pass through each other and only bullets kill, with the
+    // ghost-through visual (T8.5) signalling it. §9.5: planes on the
+    // runway don't collide either way, so taxi stacking is allowed.
     //
-    // At max airspeed (700 u/s) the per-tick relative motion between a pair
-    // is ≤ 2·(700·dt) ≈ 23 u, well under 2·planeRadius = 40 u, so a static
-    // end-of-tick circle-circle test catches every overlap without a swept
-    // capsule. Dogfight-mode pass-through (≥ 5 planes, §9.3 / §9.4) wires
-    // in at T8.3, with the ghost-through visual telegraph at T8.5.
-    const minRamDistSq = (2 * HITBOX.planeRadius) * (2 * HITBOX.planeRadius);
-    for (let i = 0; i < planes.length; i++) {
-      const a = planes[i]!;
-      if (a.state === 'crashed') continue;
-      if (a.y + HITBOX.planeRadius >= WORLD.groundY) continue;
-      for (let j = i + 1; j < planes.length; j++) {
-        const b = planes[j]!;
-        if (b.state === 'crashed') continue;
-        if (b.y + HITBOX.planeRadius >= WORLD.groundY) continue;
-        const dx = a.x - b.x;
-        const dy = a.y - b.y;
-        if (dx * dx + dy * dy < minRamDistSq) {
-          crashPlane(a, `ram vs P${j + 1}`);
-          crashPlane(b, `ram vs P${i + 1}`);
+    // At max airspeed (700 u/s) the per-tick relative motion between a
+    // pair is ≤ 2·(700·dt) ≈ 23 u, well under 2·planeRadius = 40 u, so a
+    // static end-of-tick circle-circle test catches every overlap without
+    // a swept capsule.
+    if (matchMode === 'closeQuarters') {
+      const minRamDistSq = (2 * HITBOX.planeRadius) * (2 * HITBOX.planeRadius);
+      for (let i = 0; i < planes.length; i++) {
+        const a = planes[i]!;
+        if (a.state === 'crashed' || a.state === 'eliminated') continue;
+        if (a.y + HITBOX.planeRadius >= WORLD.groundY) continue;
+        for (let j = i + 1; j < planes.length; j++) {
+          const b = planes[j]!;
+          if (b.state === 'crashed' || b.state === 'eliminated') continue;
+          if (b.y + HITBOX.planeRadius >= WORLD.groundY) continue;
+          const dx = a.x - b.x;
+          const dy = a.y - b.y;
+          if (dx * dx + dy * dy < minRamDistSq) {
+            crashPlane(a, `ram vs P${j + 1}`);
+            crashPlane(b, `ram vs P${i + 1}`);
+          }
         }
       }
     }
@@ -867,7 +996,7 @@ function init(): void {
       let planeT = Infinity;
       let hitTarget: Plane | undefined;
       for (const target of planesForCollision) {
-        if (target.state === 'crashed') continue;
+        if (target.state === 'crashed' || target.state === 'eliminated') continue;
         // Grounded-plane immunity — §10, T4.6. Position-based, NOT state-
         // based: any plane whose hitbox still touches the runway surface
         // (including the tangent-to-surface frame right after lift-off) is
@@ -933,8 +1062,12 @@ function init(): void {
     if (aliveCount <= 1) {
       matchOver = true;
       matchOutcome =
-        aliveCount === 0 ? 'draw' : aliveIndex === 0 ? 'P1' : 'P2';
-      console.log(`[match] ${matchOutcome === 'draw' ? 'DRAW' : matchOutcome + ' WINS'}`);
+        aliveCount === 0
+          ? { kind: 'draw' }
+          : { kind: 'winner', index: aliveIndex };
+      console.log(
+        `[match] ${matchOutcome.kind === 'draw' ? 'DRAW' : `P${matchOutcome.index + 1} WINS`}`,
+      );
     }
   }
 
@@ -1095,11 +1228,14 @@ function init(): void {
       }
     }
 
-    drawControlRow('P1', plane1.color, 'A  S  D', rowAnnotation, 656);
+    // Setup preview uses PLAYER_COLORS directly rather than planes[].color
+    // so it renders correctly before / between matches when the planes
+    // array may not reflect the pending selections yet.
+    drawControlRow('P1', PLAYER_COLORS[0] ?? '#fff', 'A  S  D', rowAnnotation, 656);
     if (setupHumans === 2) {
-      drawControlRow('P2', plane2.color, 'J  K  L', rowAnnotation, 690);
+      drawControlRow('P2', PLAYER_COLORS[1] ?? '#fff', 'J  K  L', rowAnnotation, 690);
     } else {
-      drawControlRow('P2', plane2.color, `AI (${setupDifficulty})`, null, 690);
+      drawControlRow('P2', PLAYER_COLORS[1] ?? '#fff', `AI (${setupDifficulty})`, null, 690);
     }
 
     // START button — disabled when combination is out of §13.1 range.
@@ -1136,7 +1272,40 @@ function init(): void {
     }
 
     drawArena(ctx);
-    for (const p of planes) {
+
+    // Dogfight-mode ghost-through effect — §9.4, §9.5, T8.5. Compute per-
+    // plane whether *this* plane is currently overlapping any other
+    // airborne plane; if so, draw it semi-transparent so the pass-through
+    // reads as intentional rather than a clipping glitch. Close Quarters
+    // mode kills on overlap (handled in update) so this never fires there.
+    const ghostingPlane: boolean[] = new Array(planes.length).fill(false);
+    if (matchMode === 'dogfight') {
+      const ghostDistSq = (2 * HITBOX.planeRadius) * (2 * HITBOX.planeRadius);
+      for (let i = 0; i < planes.length; i++) {
+        const a = planes[i]!;
+        if (a.state === 'crashed' || a.state === 'eliminated') continue;
+        if (a.y + HITBOX.planeRadius >= WORLD.groundY) continue;
+        for (let j = i + 1; j < planes.length; j++) {
+          const b = planes[j]!;
+          if (b.state === 'crashed' || b.state === 'eliminated') continue;
+          if (b.y + HITBOX.planeRadius >= WORLD.groundY) continue;
+          const dx = a.x - b.x;
+          const dy = a.y - b.y;
+          if (dx * dx + dy * dy < ghostDistSq) {
+            ghostingPlane[i] = true;
+            ghostingPlane[j] = true;
+          }
+        }
+      }
+    }
+
+    for (let i = 0; i < planes.length; i++) {
+      const p = planes[i]!;
+      // Eliminated planes are out of the match (§12) — the wreck's 1.5 s
+      // explosion delay has already elapsed, so don't render anything.
+      if (p.state === 'eliminated') continue;
+      const ghosting = ghostingPlane[i];
+      if (ghosting) ctx.globalAlpha = 0.45;
       drawPlane(ctx, p);
       // Wrap-ghost: render a second copy at the opposite edge while the
       // sprite straddles the left/right boundary so the crossing looks
@@ -1147,16 +1316,48 @@ function init(): void {
       } else if (p.x > WORLD.width - PLANE_SPRITE_EXTENT) {
         drawPlane(ctx, p, -WORLD.width);
       }
+      if (ghosting) ctx.globalAlpha = 1.0;
     }
 
     // Bullets render above planes so a round passing in front of a plane
     // reads correctly. Bullets don't wrap (§10) so no ghost pass.
     for (const b of bullets) drawBullet(ctx, b);
 
+    // Match-start mode banner — §9.4, T8.4. Brief flash at match start so
+    // the active collision rule is unambiguous. Fades out over the last
+    // ~0.6 s of its lifetime. Rendered in the plane-colour emphasis hue
+    // used by the persistent HUD indicator for continuity.
+    if (matchStartBannerRemainingSec > 0) {
+      const fadeStart = 0.6;
+      const alpha =
+        matchStartBannerRemainingSec >= fadeStart
+          ? 1
+          : matchStartBannerRemainingSec / fadeStart;
+      const bannerText = matchMode === 'dogfight' ? 'BULLETS ONLY' : 'RAMMING ON';
+      const bannerColor = matchMode === 'dogfight' ? '#7ac6ff' : '#ffb06b';
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = bannerColor;
+      ctx.font = 'bold 108px system-ui, sans-serif';
+      ctx.fillText(bannerText, WORLD.width / 2, WORLD.height * 0.22);
+      ctx.font = 'bold 36px system-ui, sans-serif';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(
+        matchMode === 'dogfight'
+          ? 'planes pass through · only bullets kill'
+          : 'mid-air collisions destroy both planes',
+        WORLD.width / 2,
+        WORLD.height * 0.22 + 72,
+      );
+      ctx.restore();
+    }
+
     ctx.fillStyle = '#fff';
     ctx.font = '28px system-ui, sans-serif';
     ctx.textAlign = 'left';
-    ctx.fillText('Carnage v4.0 — T7.5 session settings persistence', 32, 48);
+    ctx.fillText(`Carnage v4.0 — Phase 8 · ${planes.length}-plane · ${matchMode === 'dogfight' ? 'Dogfight' : 'Close Quarters'}`, 32, 48);
 
     ctx.textAlign = 'right';
     ctx.fillText(`frames:    ${frameCount}`, WORLD.width - 32, 48);
@@ -1186,65 +1387,119 @@ function init(): void {
         ctx.fillText(`auto-start:${p.autoStartTimerSec.toFixed(2)}s`, x, 416);
       }
     }
-    drawPlaneStats(`P1 (${pilots[0]?.label ?? '—'})`, plane1, 32, 'left');
-    drawPlaneStats(`P2 (${pilots[1]?.label ?? '—'})`, plane2, WORLD.width - 32, 'right');
-
-    // Per-player lives in the bottom HUD strip — §7, §12, §16.3. Label +
-    // row of pips, coloured with the plane's signature colour. Pips spread
-    // away from the label, so lost lives fall off the far side and the
-    // remaining count clusters near the player's identity label. Total pip
-    // count is fixed at `MATCH.startingLives`; dim/outlined pips are lost,
-    // solid pips are remaining.
-    const hudCentreY = WORLD.groundY + WORLD.hudHeight / 2;
-    function drawLivesHud(label: string, p: Plane, x: number, align: CanvasTextAlign): void {
-      ctx.save();
-      ctx.font = 'bold 36px system-ui, sans-serif';
-      ctx.textAlign = align;
-      ctx.textBaseline = 'middle';
-      ctx.fillStyle = p.color;
-      ctx.fillText(label, x, hudCentreY);
-
-      const labelPad = 120;
-      const pipRadius = 10;
-      const pipGap = 28;
-      const dirSign = align === 'left' ? 1 : -1;
-      const pipStartX = x + dirSign * labelPad;
-      for (let i = 0; i < MATCH.startingLives; i++) {
-        const cx = pipStartX + dirSign * i * pipGap;
-        ctx.beginPath();
-        ctx.arc(cx, hudCentreY, pipRadius, 0, Math.PI * 2);
-        if (i < p.lives) {
-          ctx.fillStyle = p.color;
-          ctx.fill();
-        } else {
-          ctx.fillStyle = '#1a1a1a';
-          ctx.fill();
-          ctx.strokeStyle = p.color;
-          ctx.lineWidth = 2;
-          ctx.stroke();
-        }
-      }
-      ctx.restore();
+    // Top-right debug stat columns: P1 right-aligned, P2 left-aligned. Only
+    // the first two planes for now — full 8-plane debug would clutter the
+    // sky. Core gameplay info (lives) reads from the bottom HUD strip below.
+    if (planes[0]) {
+      drawPlaneStats(
+        `P1 (${pilots[0]?.label ?? '—'})`,
+        planes[0],
+        32,
+        'left',
+      );
     }
-    drawLivesHud('P1', plane1, 32, 'left');
-    drawLivesHud('P2', plane2, WORLD.width - 32, 'right');
+    if (planes[1]) {
+      drawPlaneStats(
+        `P2 (${pilots[1]?.label ?? '—'})`,
+        planes[1],
+        WORLD.width - 32,
+        'right',
+      );
+    }
+
+    // Per-player lives — §7, §12, §16.3. Bottom HUD strip. One compact
+    // slot per plane with a fixed max slot width so layout stays tight
+    // regardless of plane count — N=2 matches cluster near the centre
+    // instead of spreading to the playfield edges. Centre gap reserved
+    // for the mode indicator (T8.4). Slot layout: left half takes the
+    // first ceil(N/2) planes, right half the rest, both packed toward
+    // the central mode gap so the whole HUD block stays visually unified.
+    const hudCentreY = WORLD.groundY + WORLD.hudHeight / 2;
+    const modeGap = 200;
+    const n = planes.length;
+    if (n > 0) {
+      const maxSlotWidth = 220;
+      const maxAvailablePerSide = (WORLD.width - modeGap - 48) / 2;
+      const leftHalfCount = Math.ceil(n / 2);
+      const rightHalfCount = n - leftHalfCount;
+      const maxHalfCount = Math.max(leftHalfCount, rightHalfCount, 1);
+      const slotWidth = Math.min(maxSlotWidth, maxAvailablePerSide / maxHalfCount);
+      const labelWidth = n <= 4 ? 52 : 40;
+      const pipGapExtra = n <= 4 ? 4 : 2;
+
+      // Left half: slots packed toward the centre gap (innermost-left
+      // slot sits just outside the mode indicator). Right half: mirror.
+      const centreX = WORLD.width / 2;
+      const leftRightEdge = centreX - modeGap / 2;
+      const rightLeftEdge = centreX + modeGap / 2;
+      const leftStartX = leftRightEdge - leftHalfCount * slotWidth;
+      for (let i = 0; i < n; i++) {
+        const p = planes[i]!;
+        const onLeft = i < leftHalfCount;
+        const slotX = onLeft
+          ? leftStartX + i * slotWidth
+          : rightLeftEdge + (i - leftHalfCount) * slotWidth;
+
+        ctx.save();
+        ctx.font = `bold ${n <= 4 ? 30 : 24}px system-ui, sans-serif`;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = p.color;
+        ctx.fillText(`P${i + 1}`, slotX + 6, hudCentreY);
+
+        const pipAreaW = slotWidth - labelWidth - 12;
+        const pipStep = pipAreaW / MATCH.startingLives;
+        const pipRadius = Math.min(9, Math.max(4, pipStep / 2 - pipGapExtra / 2));
+        const pipStartX = slotX + labelWidth + 6;
+        for (let life = 0; life < MATCH.startingLives; life++) {
+          const cx = pipStartX + life * pipStep + pipStep / 2;
+          ctx.beginPath();
+          ctx.arc(cx, hudCentreY, pipRadius, 0, Math.PI * 2);
+          if (life < p.lives) {
+            ctx.fillStyle = p.color;
+            ctx.fill();
+          } else {
+            ctx.fillStyle = '#1a1a1a';
+            ctx.fill();
+            ctx.strokeStyle = p.color;
+            ctx.lineWidth = 2;
+            ctx.stroke();
+          }
+        }
+        ctx.restore();
+      }
+    }
+
+    // Centre mode indicator (§9.4, T8.4) — persistent HUD label so the
+    // active collision rule is unambiguous throughout the match.
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 22px system-ui, sans-serif';
+    ctx.fillStyle = matchMode === 'dogfight' ? '#7ac6ff' : '#ffb06b';
+    const modeLabel = matchMode === 'dogfight' ? 'BULLETS ONLY' : 'RAMMING ON';
+    ctx.fillText(modeLabel, WORLD.width / 2, hudCentreY);
+    ctx.restore();
 
     // Result overlay — §12, T5.5. Drawn last so it sits above planes,
     // bullets and HUD. Dim the sky (not the HUD strip — lives + bottom bar
     // stay legible so the player can see the final score), name the winner
     // in their signature colour, and show a Play Again button as the visual
     // affordance. Click anywhere on canvas OR Enter / Space restarts.
-    if (matchOver) {
+    if (matchOver && matchOutcome) {
       ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
       ctx.fillRect(0, 0, WORLD.width, WORLD.groundY);
 
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      const winMsg = matchOutcome === 'draw' ? 'DRAW' : `${matchOutcome} WINS`;
+      const winMsg =
+        matchOutcome.kind === 'draw'
+          ? 'DRAW'
+          : `P${matchOutcome.index + 1} WINS`;
       const winColor =
-        matchOutcome === 'P1' ? plane1.color
-        : matchOutcome === 'P2' ? plane2.color
-        : '#ffffff';
+        matchOutcome.kind === 'winner'
+          ? planes[matchOutcome.index]?.color ?? '#ffffff'
+          : '#ffffff';
       ctx.fillStyle = winColor;
       ctx.font = 'bold 120px system-ui, sans-serif';
       ctx.fillText(winMsg, WORLD.width / 2, WORLD.height * 0.32);
