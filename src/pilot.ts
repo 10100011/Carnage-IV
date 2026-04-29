@@ -150,6 +150,13 @@ export interface PilotInput {
 export interface Pilot {
   /** Short label used in debug HUDs — keeps pilot identity visible while testing. */
   readonly label: string;
+  /**
+   * Pilot kind. Used by the match-end / skip-to-result logic (§12, T11.4)
+   * to decide whether to surface the AI-only continuation skip button —
+   * i.e. whether this slot is a human player whose elimination matters
+   * for the "no humans alive" condition.
+   */
+  readonly kind: 'human' | 'ai';
   update(plane: Plane, world: World, dt: number): PilotInput;
 }
 
@@ -168,6 +175,7 @@ export const IDLE_INPUT: PilotInput = Object.freeze({
  */
 export class AiPilotStub implements Pilot {
   readonly label = 'AI (stub)';
+  readonly kind = 'ai' as const;
   update(): PilotInput {
     return IDLE_INPUT;
   }
@@ -194,6 +202,7 @@ export class AiPilotStub implements Pilot {
  */
 export class AiPilot implements Pilot {
   readonly label: string;
+  readonly kind = 'ai' as const;
   private readonly params: typeof AI[AiDifficulty];
 
   /** Per-spawn randomized taxi-commit delay sentinel. -1 = not initialised. */

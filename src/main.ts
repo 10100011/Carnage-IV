@@ -6,6 +6,13 @@ import {
   type Bullet,
 } from './bullet';
 import { BULLETS, HITBOX, MATCH, PHYSICS, PLAYER_COLORS, PLAYERS, STROKE, TOWER, WORLD } from './config';
+import {
+  drawExplosions,
+  spawnExplosion,
+  spawnStallPuff,
+  updateExplosions,
+  type ExplosionParticle,
+} from './explosion';
 import { startLoop } from './loop';
 import {
   drawPlane,
@@ -269,10 +276,115 @@ function init(): void {
     return slots[slots.length - 1] ?? plane.spawn.x;
   }
 
+  // Mobile / touch support — §6, §14.2, Phase 10. Browsers don't expose a
+  // clean "is this a touch device" signal, but the intersection of no-mouse
+  // + touch-points-available is a reliable heuristic. We gate the portrait
+  // overlay and virtual-button rendering on this so desktop users in a
+  // narrow window don't get the "rotate your device" screen.
+  const isTouchDevice =
+    'ontouchstart' in window ||
+    (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0);
+  canvas.style.touchAction = 'none';
+
+  function isPortraitOrientation(): boolean {
+    if (!isTouchDevice) return false;
+    return window.innerHeight > window.innerWidth;
+  }
+
+  /** Map a client-pixel coordinate to a logical-playfield coordinate. */
+  function screenToLogical(clientX: number, clientY: number): { x: number; y: number } {
+    const rect = canvas.getBoundingClientRect();
+    const screenX = (clientX - rect.left) * (canvas.width / rect.width);
+    const screenY = (clientY - rect.top) * (canvas.height / rect.height);
+    return {
+      x: (screenX - viewport.offsetX) / viewport.scale,
+      y: (screenY - viewport.offsetY) / viewport.scale,
+    };
+  }
+
+  // Virtual-button layout for mobile play (§14.2). Six buttons total —
+  // three per player, laid out along the bottom of the playfield so both
+  // players can reach their own set in landscape. Positioned above the
+  // HUD strip so life pips stay readable; translucent fill in render so
+  // any planes briefly flying through the lower-playfield stay visible.
+  type TouchControl =
+    | 'p1-ccw' | 'p1-action' | 'p1-cw'
+    | 'p2-ccw' | 'p2-action' | 'p2-cw';
+
+  interface VirtualButton {
+    control: TouchControl;
+    x: number;
+    y: number;
+    radius: number;
+    player: 1 | 2;
+  }
+
+  const VBTN_Y = WORLD.height - 220;
+  const VBTN_ROT_R = 80;
+  const VBTN_ACTION_R = 100;
+  const VBTN_GAP = 40;
+  const VBTN_EDGE = 70;
+  const VIRTUAL_BUTTONS: readonly VirtualButton[] = [
+    // P1 — left half, left-to-right: CCW · action · CW.
+    { control: 'p1-ccw', player: 1, x: VBTN_EDGE + VBTN_ROT_R, y: VBTN_Y, radius: VBTN_ROT_R },
+    { control: 'p1-action', player: 1, x: VBTN_EDGE + VBTN_ROT_R * 2 + VBTN_GAP + VBTN_ACTION_R, y: VBTN_Y, radius: VBTN_ACTION_R },
+    { control: 'p1-cw', player: 1, x: VBTN_EDGE + VBTN_ROT_R * 2 + VBTN_GAP * 2 + VBTN_ACTION_R * 2 + VBTN_ROT_R, y: VBTN_Y, radius: VBTN_ROT_R },
+    // P2 — right half, mirror.
+    { control: 'p2-cw', player: 2, x: WORLD.width - (VBTN_EDGE + VBTN_ROT_R), y: VBTN_Y, radius: VBTN_ROT_R },
+    { control: 'p2-action', player: 2, x: WORLD.width - (VBTN_EDGE + VBTN_ROT_R * 2 + VBTN_GAP + VBTN_ACTION_R), y: VBTN_Y, radius: VBTN_ACTION_R },
+    { control: 'p2-ccw', player: 2, x: WORLD.width - (VBTN_EDGE + VBTN_ROT_R * 2 + VBTN_GAP * 2 + VBTN_ACTION_R * 2 + VBTN_ROT_R), y: VBTN_Y, radius: VBTN_ROT_R },
+  ];
+
+  /** Control → synthetic keyboard key mapping (matches §14.1 desktop bindings). */
+  const TOUCH_CONTROL_KEY: Record<TouchControl, string> = {
+    'p1-ccw': 'a',
+    'p1-action': 's',
+    'p1-cw': 'd',
+    'p2-ccw': 'j',
+    'p2-action': 'k',
+    'p2-cw': 'l',
+  };
+
+  /** touch.identifier → (control, associated key) while the finger is down. */
+  const activeTouches = new Map<number, TouchControl>();
+  /** Which virtual buttons are currently held — drives the render highlight. */
+  const pressedVirtualButtons = new Set<TouchControl>();
+
+  function hitTestVirtualButton(x: number, y: number): TouchControl | null {
+    for (const btn of VIRTUAL_BUTTONS) {
+      const dx = x - btn.x;
+      const dy = y - btn.y;
+      if (dx * dx + dy * dy < btn.radius * btn.radius) return btn.control;
+    }
+    return null;
+  }
+
+  function applyTouchControl(control: TouchControl, active: boolean): void {
+    const key = TOUCH_CONTROL_KEY[control];
+    if (active) {
+      keys[key] = true;
+      pressedVirtualButtons.add(control);
+      if (control === 'p1-action' || control === 'p2-action') {
+        // Action buttons need an edge press for taxi commit + single-tap
+        // fire. Human pilot reads `pressedKeys` once per update tick.
+        pressedKeys.add(key);
+      }
+    } else {
+      keys[key] = false;
+      pressedVirtualButtons.delete(control);
+    }
+  }
+
   // All live bullets fired by any plane. Per-plane cap (§10, T4.2) and
   // edge-expiry (T4.3) layer in next; for T4.1 the pool grows on fire and
   // shrinks only via the safety-lifetime sweep below.
   const bullets: Bullet[] = [];
+
+  // Crash-explosion particles (T11.1, §5 Build Phases). Spawned by
+  // `crashPlane`, aged in the update loop, drawn in render. The list is
+  // shared across all planes; particles self-expire well within the §12
+  // 1.5 s respawn window so smoke never outlives the wreck.
+  const explosions: ExplosionParticle[] = [];
 
   // Held-key map for input. Extracted to src/input.ts later (T5.2 P1/P2 mapping).
   // Both the held-key map and the press-edge set store lowercased key names,
@@ -309,23 +421,18 @@ function init(): void {
   window.addEventListener('keyup', (ev) => {
     keys[ev.key.toLowerCase()] = false;
   });
-  // Click routing per screen — buttons draw at specific rects but the
-  // hit-test is forgiving enough that clicking near-but-not-on still works.
-  canvas.addEventListener('click', (ev) => {
-    const rect = canvas.getBoundingClientRect();
-    const screenX = (ev.clientX - rect.left) * (canvas.width / rect.width);
-    const screenY = (ev.clientY - rect.top) * (canvas.height / rect.height);
-    const logicalX = (screenX - viewport.offsetX) / viewport.scale;
-    const logicalY = (screenY - viewport.offsetY) / viewport.scale;
+  // Shared tap handler for UI screens — click and touchstart both route
+  // here so the setup + result screens work identically on mouse and
+  // touch. Mid-match taps on virtual buttons are handled separately in
+  // the touch handler before falling through here.
+  function handleUITap(logicalX: number, logicalY: number): void {
     if (gameState === 'setup') {
-      // Humans selector.
       for (const v of [1, 2] as const) {
         if (hitTestButton(logicalX, logicalY, humansBtnRect(v))) {
           setHumansChoice(v);
           return;
         }
       }
-      // AI count selector — skip disabled values silently.
       for (let v = 0; v <= 7; v++) {
         if (aiCountDisabled(v)) continue;
         if (hitTestButton(logicalX, logicalY, aiBtnRect(v))) {
@@ -333,7 +440,6 @@ function init(): void {
           return;
         }
       }
-      // Difficulty selector — skip disabled tiers.
       for (const d of ['easy', 'medium', 'hard'] as const) {
         if (difficultyDisabled(d)) continue;
         if (hitTestButton(logicalX, logicalY, difficultyBtnRect(d))) {
@@ -341,7 +447,6 @@ function init(): void {
           return;
         }
       }
-      // START — only fires when the combination is in-range.
       if (setupIsValid() && hitTestButton(logicalX, logicalY, SETUP_START_BUTTON)) {
         startMatch();
       }
@@ -351,7 +456,65 @@ function init(): void {
       if (hitTestButton(logicalX, logicalY, RESULT_PLAY_AGAIN_BUTTON)) exitToSetup();
       return;
     }
+    // Skip-to-result tap (§12, T11.4) — only registers while the button
+    // is actually rendered (humans all out, match still live).
+    if (
+      gameState === 'match' &&
+      humansAllEliminated() &&
+      hitTestButton(logicalX, logicalY, SKIP_TO_RESULT_BUTTON)
+    ) {
+      skipToResult();
+    }
+  }
+
+  canvas.addEventListener('click', (ev) => {
+    const { x, y } = screenToLogical(ev.clientX, ev.clientY);
+    handleUITap(x, y);
   });
+
+  // Touch handlers — §14.2, T10.2/T10.3/T10.4/T10.5. Mid-match, each touch
+  // is bound at start to whichever virtual button it landed on and stays
+  // bound to that control until the finger lifts. Setup / result screen
+  // taps route through `handleUITap` just like clicks.
+  canvas.addEventListener('touchstart', (ev) => {
+    ev.preventDefault();
+    // Block every tap while the rotate-device overlay is up — the user
+    // can't see the UI behind it, so interacting with it would surprise.
+    if (isPortraitOrientation()) return;
+    for (let i = 0; i < ev.changedTouches.length; i++) {
+      const t = ev.changedTouches[i]!;
+      const { x, y } = screenToLogical(t.clientX, t.clientY);
+      if (gameState === 'match' && !matchOver) {
+        const control = hitTestVirtualButton(x, y);
+        if (control !== null) {
+          activeTouches.set(t.identifier, control);
+          applyTouchControl(control, true);
+          continue;
+        }
+      }
+      handleUITap(x, y);
+    }
+  }, { passive: false });
+
+  function releaseTouch(identifier: number): void {
+    const control = activeTouches.get(identifier);
+    if (control !== undefined) {
+      applyTouchControl(control, false);
+      activeTouches.delete(identifier);
+    }
+  }
+  canvas.addEventListener('touchend', (ev) => {
+    ev.preventDefault();
+    for (let i = 0; i < ev.changedTouches.length; i++) {
+      releaseTouch(ev.changedTouches[i]!.identifier);
+    }
+  }, { passive: false });
+  canvas.addEventListener('touchcancel', (ev) => {
+    ev.preventDefault();
+    for (let i = 0; i < ev.changedTouches.length; i++) {
+      releaseTouch(ev.changedTouches[i]!.identifier);
+    }
+  }, { passive: false });
 
   // Per-plane pilot assignment, index-aligned with `planes` (§15.1). Every
   // plane that participates in the sim has a pilot — humans wrap the
@@ -368,6 +531,7 @@ function init(): void {
     const label = `${bindings.ccw.toUpperCase()}/${bindings.action.toUpperCase()}/${bindings.cw.toUpperCase()}`;
     return {
       label,
+      kind: 'human',
       update(): PilotInput {
         const ccwDown = keys[bindings.ccw] === true;
         const cwDown = keys[bindings.cw] === true;
@@ -552,6 +716,19 @@ function init(): void {
     w: 440,
     h: 104,
   };
+  /**
+   * Skip-to-result button — §12, T11.4. Surfaces only when every human
+   * pilot in the match is permanently eliminated and AI continue to fight.
+   * Top-centre of the playfield so it doesn't clash with the bottom HUD or
+   * the per-plane debug stat columns. Width / height tuned to be obvious
+   * without dominating the screen — this is an opt-out, not the default.
+   */
+  const SKIP_TO_RESULT_BUTTON: ButtonRect = {
+    x: WORLD.width / 2 - 220,
+    y: 130,
+    w: 440,
+    h: 80,
+  };
 
   function hitTestButton(logicalX: number, logicalY: number, btn: ButtonRect): boolean {
     return (
@@ -600,6 +777,7 @@ function init(): void {
       p.lives = MATCH.startingLives;
     }
     bullets.length = 0;
+    explosions.length = 0;
     // Flush any input collected while the result / setup screen was up so
     // it can't bleed into the first tick of the new match (held rotation
     // keys, a stray taxi-commit press during result-screen fiddling, etc.).
@@ -608,6 +786,58 @@ function init(): void {
     matchOver = false;
     matchOutcome = null;
     console.log('[match] reset — new match');
+  }
+
+  /**
+   * `true` while at least one human pilot was assigned this match and every
+   * such plane is permanently out (lives ≤ 0). Drives the §12 / T11.4 skip-
+   * to-result button. AI-only matches (humans = 0) never trigger — the
+   * button has no audience there.
+   */
+  function humansAllEliminated(): boolean {
+    let humanCount = 0;
+    for (let i = 0; i < pilots.length; i++) {
+      if (pilots[i]?.kind !== 'human') continue;
+      humanCount++;
+      if (planes[i]!.lives > 0) return false;
+    }
+    return humanCount > 0;
+  }
+
+  /**
+   * §12 skip-to-result: end the AI-vs-AI continuation immediately and
+   * declare the AI currently leading in lives the winner. Tie at the top
+   * → draw. Per the spec this is an explicit *approximation* — we do not
+   * simulate who'd actually have prevailed had play continued.
+   *
+   * Idempotent if matchOver is already set; the button only renders while
+   * the match is live, but a same-tick double-click could still arrive.
+   */
+  function skipToResult(): void {
+    if (matchOver) return;
+    let topLives = -1;
+    let topIndex = -1;
+    let tiedAtTop = false;
+    for (let i = 0; i < planes.length; i++) {
+      if (pilots[i]?.kind !== 'ai') continue;
+      if (planes[i]!.lives <= 0) continue;
+      const lives = planes[i]!.lives;
+      if (lives > topLives) {
+        topLives = lives;
+        topIndex = i;
+        tiedAtTop = false;
+      } else if (lives === topLives) {
+        tiedAtTop = true;
+      }
+    }
+    matchOver = true;
+    matchOutcome =
+      topIndex < 0 || tiedAtTop
+        ? { kind: 'draw' }
+        : { kind: 'winner', index: topIndex };
+    console.log(
+      `[match] skip-to-result → ${matchOutcome.kind === 'draw' ? 'DRAW' : `P${matchOutcome.index + 1} WINS`} (lives leader)`,
+    );
   }
 
   function startMatch(): void {
@@ -647,6 +877,7 @@ function init(): void {
     plane.taxiCommitted = false;
     plane.respawnTimerSec = MATCH.respawnDelaySec;
     plane.lives -= 1;
+    spawnExplosion(explosions, plane.x, plane.y, plane.color);
     console.log(
       `[crash] ${reason} at x=${plane.x.toFixed(0)}, y=${plane.y.toFixed(0)}, lives=${plane.lives}, simTime=${simTimeSec.toFixed(2)}s`,
     );
@@ -888,11 +1119,15 @@ function init(): void {
   }
 
   function update(dt: number): void {
-    // The sim only runs while a match is actively being played. Setup and
-    // match-over freezes both early-return — their screens are rendered
-    // on top of the frozen frame and input is routed to the UI, not the
-    // plane physics.
-    if (gameState === 'setup' || matchOver) return;
+    // The sim only runs while a match is actively being played AND the
+    // device is in landscape (§6). Setup, match-over, and portrait-on-
+    // mobile all early-return — their screens are rendered on top of the
+    // frozen frame and input is routed to the UI, not the plane physics.
+    if (gameState === 'setup' || isPortraitOrientation()) return;
+    // Crash-explosion particles tick even after matchOver so a final-life
+    // crash isn't frozen mid-burst on the result overlay (T11.1).
+    updateExplosions(explosions, dt);
+    if (matchOver) return;
     simSteps++;
     simTimeSec += dt;
 
@@ -924,6 +1159,20 @@ function init(): void {
 
     // Per-plane physics + environment collisions.
     for (const p of planes) stepPhysics(p, dt);
+
+    // Stall smoke (T11.3). Each stalled plane emits puffs from its tail at
+    // ~STALL_SMOKE_RATE puffs/sec via the standard rate-trial. Tail offset
+    // mirrors the nose offset used for bullet spawn so smoke trails behind
+    // the airframe regardless of facing.
+    const STALL_SMOKE_RATE = 22;
+    const tailDist = PLANE_NOSE_OFFSET * 0.6;
+    for (const p of planes) {
+      if (p.state !== 'stalled') continue;
+      if (Math.random() >= dt * STALL_SMOKE_RATE) continue;
+      const tx = p.x - Math.sin(p.heading) * tailDist;
+      const ty = p.y + Math.cos(p.heading) * tailDist;
+      spawnStallPuff(explosions, tx, ty);
+    }
 
     // Plane-plane mid-air collision — §9.3, §9.5. Close Quarters mode
     // (≤ 4 planes) crashes both participants on any in-air hitbox overlap;
@@ -1255,11 +1504,102 @@ function init(): void {
     );
   }
 
+  function renderRotateOverlay(): void {
+    // Drawn in raw canvas coordinates so sizing is consistent regardless
+    // of the (nonsensical) portrait letterbox transform that would apply
+    // via the viewport. Fills the whole canvas in dark.
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#14192a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    const cx = canvas.width / 2;
+    const cy = canvas.height / 2;
+    const base = Math.min(canvas.width, canvas.height) * 0.06;
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = `bold ${base * 1.4}px system-ui, sans-serif`;
+    ctx.fillText('ROTATE YOUR DEVICE', cx, cy - base * 0.9);
+    ctx.font = `${base * 0.7}px system-ui, sans-serif`;
+    ctx.fillStyle = '#d6e4f2';
+    ctx.fillText('Carnage plays in landscape orientation.', cx, cy + base * 0.6);
+    ctx.restore();
+  }
+
+  /**
+   * Auto-start warning pulse (§11, T11.2). At each entry of the timer past
+   * a `MATCH.autoStartWarningsSec` threshold (T−2 s and T−1 s by default),
+   * emit a single short expanding-ring pulse around the plane. Subtle by
+   * design — §11 calls this a cue, not a rescue alarm — so the ring fades
+   * fully within ~0.5 s and only appears at the two trigger moments.
+   *
+   * Driven entirely off `autoStartTimerSec`; no separate event state is
+   * needed. The pulse window for trigger T is the half-open interval
+   * (timer ≤ T) ∧ (T − timer ≤ PULSE_DUR), which catches every tick the
+   * pulse should be visible regardless of dt jitter.
+   */
+  const AUTO_START_PULSE_DUR_SEC = 0.5;
+  function drawAutoStartWarning(p: Plane): void {
+    if (p.state !== 'grounded' || p.taxiCommitted) return;
+    for (const triggerAt of MATCH.autoStartWarningsSec) {
+      const sinceTrigger = triggerAt - p.autoStartTimerSec;
+      if (sinceTrigger < 0 || sinceTrigger > AUTO_START_PULSE_DUR_SEC) continue;
+      const t = sinceTrigger / AUTO_START_PULSE_DUR_SEC;
+      const r = HITBOX.planeRadius * (1.6 + 1.6 * t);
+      ctx.save();
+      ctx.globalAlpha = (1 - t) * 0.85;
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = 4 * (1 - t) + 1;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  /**
+   * Draw a single virtual button — translucent tan disc with a symbol,
+   * brighter highlight while the player's finger is down. Kept simple so
+   * the buttons don't obscure the playfield more than necessary (§14.2).
+   */
+  function drawVirtualButton(btn: VirtualButton): void {
+    const pressed = pressedVirtualButtons.has(btn.control);
+    const color = btn.player === 1 ? PLAYER_COLORS[0]! : PLAYER_COLORS[1]!;
+    ctx.save();
+    ctx.globalAlpha = pressed ? 0.9 : 0.45;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(btn.x, btn.y, btn.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = '#2a2014';
+    ctx.lineWidth = STROKE.object;
+    ctx.stroke();
+    ctx.fillStyle = '#2a2014';
+    ctx.font = `bold ${btn.radius * 0.9}px system-ui, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const glyph =
+      btn.control === 'p1-ccw' || btn.control === 'p2-ccw' ? '◀'
+      : btn.control === 'p1-cw' || btn.control === 'p2-cw' ? '▶'
+      : '●';
+    ctx.fillText(glyph, btn.x, btn.y + btn.radius * 0.05);
+    ctx.restore();
+  }
+
   function render(): void {
     frameCount++;
 
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Portrait overlay — §6. Drawn in canvas-pixel coords (bypasses the
+    // logical playfield transform so text is sized against the actual
+    // window regardless of the letterboxing from the 16:9 assumption).
+    if (isPortraitOrientation()) {
+      renderRotateOverlay();
+      return;
+    }
 
     ctx.save();
     ctx.translate(viewport.offsetX, viewport.offsetY);
@@ -1304,6 +1644,10 @@ function init(): void {
       // Eliminated planes are out of the match (§12) — the wreck's 1.5 s
       // explosion delay has already elapsed, so don't render anything.
       if (p.state === 'eliminated') continue;
+      // Auto-start warning pulses (T11.2, §11). Subtle expanding ring
+      // emitted at T−2 s and T−1 s before auto-start fires — drawn under
+      // the plane sprite so it reads as a halo around the airframe.
+      drawAutoStartWarning(p);
       const ghosting = ghostingPlane[i];
       if (ghosting) ctx.globalAlpha = 0.45;
       drawPlane(ctx, p);
@@ -1318,6 +1662,11 @@ function init(): void {
       }
       if (ghosting) ctx.globalAlpha = 1.0;
     }
+
+    // Crash explosions (T11.1) — drawn above planes so flecks visibly
+    // emerge from the wreck rather than getting hidden behind it. Below
+    // bullets so an in-flight round still reads against any active burst.
+    drawExplosions(ctx, explosions);
 
     // Bullets render above planes so a round passing in front of a plane
     // reads correctly. Bullets don't wrap (§10) so no ghost pass.
@@ -1357,7 +1706,7 @@ function init(): void {
     ctx.fillStyle = '#fff';
     ctx.font = '28px system-ui, sans-serif';
     ctx.textAlign = 'left';
-    ctx.fillText(`Carnage v4.0 — Phase 9 · ${planes.length}-plane · ${matchMode === 'dogfight' ? 'Dogfight' : 'Close Quarters'}`, 32, 48);
+    ctx.fillText(`Carnage v4.0 — Phase 11 · ${planes.length}-plane · ${matchMode === 'dogfight' ? 'Dogfight' : 'Close Quarters'}`, 32, 48);
 
     ctx.textAlign = 'right';
     ctx.fillText(`frames:    ${frameCount}`, WORLD.width - 32, 48);
@@ -1480,6 +1829,30 @@ function init(): void {
     const modeLabel = matchMode === 'dogfight' ? 'BULLETS ONLY' : 'RAMMING ON';
     ctx.fillText(modeLabel, WORLD.width / 2, hudCentreY);
     ctx.restore();
+
+    // Skip-to-result button (§12, T11.4) — only while every human is out
+    // and AI fight on. Rendered above the bottom-half so it stays clear
+    // of the playfield action and out from under the result overlay.
+    if (!matchOver && humansAllEliminated()) {
+      drawButton(SKIP_TO_RESULT_BUTTON, 'SKIP TO RESULT', 36);
+      ctx.fillStyle = '#e8e8e8';
+      ctx.font = '20px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText(
+        'AI fight to the finish — skip to declare the lives leader',
+        WORLD.width / 2,
+        SKIP_TO_RESULT_BUTTON.y + SKIP_TO_RESULT_BUTTON.h + 28,
+      );
+    }
+
+    // Virtual touch controls — §14.2, T10.3 / T10.4. Rendered only on
+    // touch devices so desktop play is undisturbed. Translucent fill
+    // keeps the playfield visible behind the button discs; pressed
+    // buttons opaque so the player sees their finger "registered".
+    if (isTouchDevice) {
+      for (const btn of VIRTUAL_BUTTONS) drawVirtualButton(btn);
+    }
 
     // Result overlay — §12, T5.5. Drawn last so it sits above planes,
     // bullets and HUD. Dim the sky (not the HUD strip — lives + bottom bar

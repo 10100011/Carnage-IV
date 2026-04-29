@@ -123,27 +123,35 @@ export function drawPlane(
   ctx.save();
   ctx.translate(plane.x + xOffset, plane.y);
   ctx.rotate(plane.heading);
+  // Stall wobble (T11.3) — small heading-jitter applied *only* to the
+  // sprite, not the underlying physics heading. Combined with the smoke
+  // trail spawned in the update loop and the red distress fill below,
+  // the stall state is unmistakable per §16.3.
+  if (plane.state === 'stalled') {
+    const wobble = Math.sin(performance.now() * 0.025) * 0.18;
+    ctx.rotate(wobble);
+  }
   // Mirror is applied *after* rotate so it flips the sprite in its local
   // (post-rotation) frame — equivalent to negating local x before drawing.
   // That keeps wheels-down / canopy-up on the asymmetric T11.7 sprite
   // regardless of whether the plane faces left or right.
   if (plane.mirror) ctx.scale(-1, 1);
 
-  // Nose points along local -y (= screen up at heading 0°).
-  // State-dependent fill — stall = distressed red, crashed = wrecked grey.
-  // Replaced by proper visuals (wobble/smoke/explosion) at T11.1 / T11.3.
-  ctx.fillStyle =
-    plane.state === 'stalled' ? '#c84c4c'
-    : plane.state === 'crashed' ? '#555'
-    : plane.color;
+  // Nose points along local -y (= screen up at heading 0°). Fill keeps the
+  // per-player signature colour even while stalled (T11.5, §16.3) — stall
+  // is signalled by wobble + smoke trail + the red distress stroke below,
+  // so identity stays readable. Crashed wrecks fall back to grey for a
+  // beat before respawn so the kill reads at a glance.
+  ctx.fillStyle = plane.state === 'crashed' ? '#555' : plane.color;
   ctx.beginPath();
   ctx.moveTo(0, -r * 1.3);
   ctx.lineTo(-r * 0.9, r * 0.7);
   ctx.lineTo(r * 0.9, r * 0.7);
   ctx.closePath();
   ctx.fill();
-  ctx.strokeStyle = '#2a2014';
-  ctx.lineWidth = STROKE.object;
+  ctx.strokeStyle = plane.state === 'stalled' ? '#c84c4c' : '#2a2014';
+  ctx.lineWidth =
+    plane.state === 'stalled' ? STROKE.emphasis : STROKE.object;
   ctx.stroke();
 
   ctx.restore();
